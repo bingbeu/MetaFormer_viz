@@ -80,6 +80,15 @@ _C.MODEL.EXTRA_TOKEN_NUM = 1
 _C.MODEL.META_DIMS = []
 _C.MODEL.assess = False
 
+# Training-only Hard-Negative Semantic Part Discrimination (HNSD).
+# Disabled by default so existing configs/checkpoints preserve the original V6
+# behaviour exactly. Enable it in the dedicated HNSD config.
+_C.MODEL.HNSD_ENABLE = False
+_C.MODEL.HNSD_WEIGHT = 0.005
+_C.MODEL.HNSD_MARGIN = 0.10
+_C.MODEL.HNSD_START_EPOCH = 20
+_C.MODEL.HNSD_WARMUP_EPOCHS = 20
+
 
 # -----------------------------------------------------------------------------
 # Training settings
