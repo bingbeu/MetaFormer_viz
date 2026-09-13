@@ -27,6 +27,21 @@ except ImportError:
     amp = None
 
 
+def get_hnsd_weight(config, epoch):
+    """Linearly warm HNSD after its delayed start epoch."""
+    if not config.MODEL.HNSD_ENABLE:
+        return 0.0
+    start_epoch = int(config.MODEL.HNSD_START_EPOCH)
+    if epoch < start_epoch:
+        return 0.0
+    base_weight = float(config.MODEL.HNSD_WEIGHT)
+    warmup_epochs = int(config.MODEL.HNSD_WARMUP_EPOCHS)
+    if warmup_epochs <= 0:
+        return base_weight
+    progress = min(1.0, float(epoch - start_epoch + 1) / float(warmup_epochs))
+    return base_weight * progress
+
+
 def parse_option():
     parser = argparse.ArgumentParser('MetaFG training and evaluation script', add_help=False)
     parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file', )
@@ -203,6 +218,15 @@ def train_one_epoch_local_data(
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
+    hnsd_loss_meter = AverageMeter()
+    hnsd_pos_meter = AverageMeter()
+    hnsd_neg_meter = AverageMeter()
+    hnsd_gap_meter = AverageMeter()
+    hnsd_active_meter = AverageMeter()
+    hnsd_valid_meter = AverageMeter()
+    hnsd_same_class_meter = AverageMeter()
+
+    hnsd_weight = get_hnsd_weight(config, epoch)
 
     start = time.time()
     end = time.time()
@@ -229,17 +253,24 @@ def train_one_epoch_local_data(
             samples, targets = mixup_fn(samples, targets)
 
         if config.DATA.ADD_META:
-            outputs, aux_full = model(samples, meta, return_aux=True)
+            outputs, aux_full = model(
+                samples,
+                meta,
+                return_aux=True,
+                hnsd_targets=hard_targets if hnsd_weight > 0.0 else None,
+            )
             align_loss = aux_full["align_loss"]
             curv_reg_loss = aux_full["curv_reg_loss"]
             part_aux_loss = aux_full["part_aux_loss"]
             route_logits = aux_full.get("route_logits", None)
+            hnsd_loss = aux_full.get("hnsd_loss", None)
         else:
             outputs = model(samples, return_aux=False)
             align_loss = None
             curv_reg_loss = None
             part_aux_loss = None
             route_logits = None
+            hnsd_loss = None
 
         cls_loss = criterion(outputs, targets)
 
@@ -259,6 +290,9 @@ def train_one_epoch_local_data(
         if loss_route is not None:
             lambda_route = getattr(raw_model, "lambda_route", 0.1)
             total_loss = total_loss + lambda_route * loss_route
+
+        if hnsd_loss is not None and hnsd_weight > 0.0:
+            total_loss = total_loss + hnsd_weight * hnsd_loss
         # if align_loss is not None and curv_reg_loss is not None:
         #     # 导师方案：单个 aux 缩放，20 个 epoch 线性升温到 0.1
         #     aux_scale = 0.1 * min(1.0, (epoch + 1) / 20.0)
@@ -344,6 +378,16 @@ def train_one_epoch_local_data(
 
         loss_meter.update(total_loss.item(), targets.size(0))
 
+        if hnsd_loss is not None and hnsd_weight > 0.0:
+            batch_size = hard_targets.size(0)
+            hnsd_loss_meter.update(hnsd_loss.item(), batch_size)
+            hnsd_pos_meter.update(aux_full["hnsd_positive_similarity"].item(), batch_size)
+            hnsd_neg_meter.update(aux_full["hnsd_negative_similarity"].item(), batch_size)
+            hnsd_gap_meter.update(aux_full["hnsd_gap"].item(), batch_size)
+            hnsd_active_meter.update(aux_full["hnsd_active_ratio"].item(), batch_size)
+            hnsd_valid_meter.update(aux_full["hnsd_valid_ratio"].item(), batch_size)
+            hnsd_same_class_meter.update(aux_full["hnsd_same_class_ratio"].item(), batch_size)
+
         if grad_norm is not None:
             if torch.is_tensor(grad_norm):
                 grad_norm = grad_norm.item()
@@ -357,7 +401,7 @@ def train_one_epoch_local_data(
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
 
-            logger.info(
+            log_message = (
                 f"Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t"
                 f"eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t"
                 f"time {batch_time.val:.4f} ({batch_time.avg:.4f})\t"
@@ -365,6 +409,17 @@ def train_one_epoch_local_data(
                 f"grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t"
                 f"mem {memory_used:.0f}MB"
             )
+            if hnsd_loss_meter.count > 0:
+                log_message += (
+                    f"\thnsd {hnsd_loss_meter.val:.4f} ({hnsd_loss_meter.avg:.4f})"
+                    f" w {hnsd_weight:.6f}"
+                    f" pos/neg {hnsd_pos_meter.val:.4f}/{hnsd_neg_meter.val:.4f}"
+                    f" gap {hnsd_gap_meter.val:.4f}"
+                    f" active {hnsd_active_meter.val:.3f}"
+                    f" valid {hnsd_valid_meter.val:.3f}"
+                    f" same-cls {hnsd_same_class_meter.val:.3f}"
+                )
+            logger.info(log_message)
 
     epoch_time = time.time() - start
     logger.info(

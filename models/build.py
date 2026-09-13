@@ -27,6 +27,8 @@ def build_model(config):
                 extra_token_num=config.MODEL.EXTRA_TOKEN_NUM,
                 meta_dims=config.MODEL.META_DIMS,
                 category_emb_path=_CATEGORY_BANK.get(config.DATA.DATASET),
+                enable_hnsd=config.MODEL.HNSD_ENABLE,
+                hnsd_margin=config.MODEL.HNSD_MARGIN,
                 assess=config.MODEL.assess
         )
     else:

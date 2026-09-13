@@ -2,6 +2,7 @@ import math
 import os
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.utils.checkpoint as checkpoint
 from timm.models.helpers import load_pretrained
 from timm.models.registry import register_model
@@ -73,6 +74,8 @@ class MetaFG_Meta(nn.Module):
                 category_emb_path: str = None,   # 类别名文本库 .npy [num_classes, 768]
                 temperature: float = 1.0,         # 类别路由 softmax 温度
                 lambda_route: float = 0.1,        # loss_route 权重
+                enable_hnsd: bool = False,
+                hnsd_margin: float = 0.10,
                 use_checkpoint=False):
         super().__init__()
         self.only_last_cls = only_last_cls
@@ -87,6 +90,10 @@ class MetaFG_Meta(nn.Module):
         self.mask_type = mask_type
         self.temperature = temperature
         self.lambda_route = lambda_route
+        self.enable_hnsd = enable_hnsd
+        self.hnsd_margin = float(hnsd_margin)
+        if self.hnsd_margin < 0:
+            raise ValueError("hnsd_margin must be non-negative")
         self.attn_embed_dims = attn_embed_dims
         self.extra_token_num = extra_token_num
         if self.add_meta:
@@ -229,7 +236,79 @@ class MetaFG_Meta(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x, meta=None, return_aux=False, force_hvp=False, force_hvp_layer=None):
+    @staticmethod
+    def _gather_detached(tensor):
+        """Gather a detached tensor from all DDP ranks for a larger negative bank."""
+        tensor = tensor.detach().contiguous()
+        if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+            return tensor
+        gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, tensor)
+        return torch.cat(gathered, dim=0)
+
+    def _hnsd_stage_loss(self, part_tokens, text_tokens, targets):
+        """Compute one-stage hard-negative local semantic ranking loss.
+
+        Text tokens and the distributed negative bank are detached. Gradients
+        therefore optimize the visual part representation without turning the
+        caption embeddings into a shortcut. Negatives sharing the image label
+        are explicitly excluded, including the image's own caption.
+        """
+        part_tokens_fp32 = F.normalize(part_tokens.float(), dim=-1)
+        positive_text_fp32 = F.normalize(text_tokens.detach().float(), dim=-1)
+        local_targets = targets.detach().long().reshape(-1)
+
+        positive_token_scores = torch.einsum(
+            "bpc,btc->bpt", part_tokens_fp32, positive_text_fp32
+        )
+        positive_scores = positive_token_scores.max(dim=-1).values.mean(dim=-1)
+
+        negative_text_bank = self._gather_detached(positive_text_fp32)
+        negative_target_bank = self._gather_detached(local_targets)
+        pair_scores = torch.einsum(
+            "bpc,ktc->bkpt", part_tokens_fp32, negative_text_bank
+        ).max(dim=-1).values.mean(dim=-1)
+
+        negative_mask = local_targets[:, None].ne(negative_target_bank[None, :])
+        valid_rows = negative_mask.any(dim=1)
+        masked_scores = pair_scores.masked_fill(
+            ~negative_mask, torch.finfo(pair_scores.dtype).min
+        )
+        hard_negative_scores, hard_negative_indices = masked_scores.max(dim=1)
+
+        per_sample_loss = F.relu(
+            self.hnsd_margin - positive_scores + hard_negative_scores
+        )
+        if valid_rows.any():
+            loss = per_sample_loss[valid_rows].mean()
+            selected_targets = negative_target_bank[hard_negative_indices[valid_rows]]
+            same_class_ratio = (
+                selected_targets == local_targets[valid_rows]
+            ).float().mean()
+            active_ratio = (
+                per_sample_loss[valid_rows] > 0
+            ).float().mean()
+            positive_mean = positive_scores[valid_rows].mean()
+            negative_mean = hard_negative_scores[valid_rows].mean()
+        else:
+            loss = part_tokens_fp32.sum() * 0.0
+            zero = loss.detach()
+            same_class_ratio = zero
+            active_ratio = zero
+            positive_mean = zero
+            negative_mean = zero
+
+        return {
+            "loss": loss,
+            "positive_similarity": positive_mean.detach(),
+            "negative_similarity": negative_mean.detach(),
+            "gap": (positive_mean - negative_mean).detach(),
+            "active_ratio": active_ratio.detach(),
+            "valid_ratio": valid_rows.float().mean().detach(),
+            "same_class_ratio": same_class_ratio.detach(),
+        }
+
+    def forward_features(self, x, meta=None, return_aux=False, force_hvp=False, force_hvp_layer=None, hnsd_targets=None):
         B = x.shape[0]
 
         extra_tokens_1 = [self.cls_token_1]
@@ -255,6 +334,23 @@ class MetaFG_Meta(nn.Module):
 
                 extra_tokens_1.append(meta_1)
                 extra_tokens_2.append(meta_2)
+
+        # Keep the projected local caption tokens only when the training-time
+        # HNSD branch is active. Normal training and inference do no extra work.
+        use_hnsd = (
+            return_aux
+            and self.enable_hnsd
+            and self.training
+            and hnsd_targets is not None
+        )
+        text_tokens_1 = (
+            torch.cat(extra_tokens_1[1:], dim=1)
+            if use_hnsd and len(extra_tokens_1) > 1 else None
+        )
+        text_tokens_2 = (
+            torch.cat(extra_tokens_2[1:], dim=1)
+            if use_hnsd and len(extra_tokens_2) > 1 else None
+        )
         x = self.stage_0(x)
         x = self.bn1(x)
         x = self.act1(x)
@@ -319,6 +415,33 @@ class MetaFG_Meta(nn.Module):
         else:
             part_tokens_2 = out_2
 
+        if return_aux:
+            hnsd_zero = part_tokens_2.new_zeros(())
+            hnsd_stats = {
+                "loss": hnsd_zero,
+                "positive_similarity": hnsd_zero.detach(),
+                "negative_similarity": hnsd_zero.detach(),
+                "gap": hnsd_zero.detach(),
+                "active_ratio": hnsd_zero.detach(),
+                "valid_ratio": hnsd_zero.detach(),
+                "same_class_ratio": hnsd_zero.detach(),
+            }
+            if (
+                use_hnsd
+                and text_tokens_1 is not None
+                and text_tokens_2 is not None
+            ):
+                hnsd_1 = self._hnsd_stage_loss(
+                    part_tokens_1, text_tokens_1, hnsd_targets
+                )
+                hnsd_2 = self._hnsd_stage_loss(
+                    part_tokens_2, text_tokens_2, hnsd_targets
+                )
+                hnsd_stats = {
+                    key: 0.5 * (hnsd_1[key] + hnsd_2[key])
+                    for key in hnsd_stats
+                }
+
         extra_tokens_2.append(part_tokens_2)
 
         x = x.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
@@ -356,6 +479,13 @@ class MetaFG_Meta(nn.Module):
                 "curv_entropy": 0.5 * (aux_1["curv_entropy"] + aux_2["curv_entropy"]),
                 "curv_weight_max": 0.5 * (aux_1["curv_weight_max"] + aux_2["curv_weight_max"]),
                 "curv_weight_mean": 0.5 * (aux_1["curv_weight_mean"] + aux_2["curv_weight_mean"]),
+                "hnsd_loss": hnsd_stats["loss"],
+                "hnsd_positive_similarity": hnsd_stats["positive_similarity"],
+                "hnsd_negative_similarity": hnsd_stats["negative_similarity"],
+                "hnsd_gap": hnsd_stats["gap"],
+                "hnsd_active_ratio": hnsd_stats["active_ratio"],
+                "hnsd_valid_ratio": hnsd_stats["valid_ratio"],
+                "hnsd_same_class_ratio": hnsd_stats["same_class_ratio"],
 
                 # ============================================================
                 # Category semantics (different resolutions: never add them)
@@ -432,7 +562,7 @@ class MetaFG_Meta(nn.Module):
             else:
                 return cls
             
-    def forward(self, x, meta=None, return_aux=False, force_hvp=False, force_hvp_layer=None):
+    def forward(self, x, meta=None, return_aux=False, force_hvp=False, force_hvp_layer=None, hnsd_targets=None):
         # ---- 原有的 meta 掩码逻辑保持不变 ----
         if meta is not None:
             if self.mask_type == "linear":
@@ -450,10 +580,10 @@ class MetaFG_Meta(nn.Module):
         # ---- 根据 return_aux 和 self.assess 分别调用 forward_features ----
         if return_aux:
             if self.assess:   # 需要返回 aux_full + 权重列表
-                feat, aux_full, layer_weights1, layer_weights2 = self.forward_features(x, meta, return_aux=True, force_hvp=force_hvp, force_hvp_layer=force_hvp_layer)
+                feat, aux_full, layer_weights1, layer_weights2 = self.forward_features(x, meta, return_aux=True, force_hvp=force_hvp, force_hvp_layer=force_hvp_layer, hnsd_targets=hnsd_targets)
                 return self.head(feat), aux_full, layer_weights1, layer_weights2
             else:             # 只返回 aux_full
-                feat, aux_full = self.forward_features(x, meta, return_aux=True, force_hvp=force_hvp, force_hvp_layer=force_hvp_layer)
+                feat, aux_full = self.forward_features(x, meta, return_aux=True, force_hvp=force_hvp, force_hvp_layer=force_hvp_layer, hnsd_targets=hnsd_targets)
                 return self.head(feat), aux_full
         else:
             if self.assess:   # 不返回 aux_full，但返回权重列表

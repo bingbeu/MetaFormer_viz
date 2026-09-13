@@ -59,6 +59,26 @@ For CUB-200-2011, run:
 ```
 CUDA_VISIBLE_DEVICES=4,5 python3 -m torch.distributed.launch --nproc_per_node 2 --master_port 12348  main.py --cfg /raid/MetaFormer/configs/MetaFG_meta_bert_1_224.yaml --batch-size 4 --tag cub-200_v1 --lr 5e-5 --min-lr 5e-7 --warmup-lr 5e-8 --epochs 300 --warmup-epochs 20 --dataset cub-200 --pretrain /raid/MetaFormer/pretrained_model/metafg_2_inat21_384.pth --accumulation-steps 2 --opts DATA.IMG_SIZE 384  
 ```
+
+#### HNSD experiment
+
+The optional Hard-Negative Semantic Part Discrimination (HNSD) branch is
+training-only. It ranks the matching image caption above the hardest caption
+from a different class, using both levels of generated part tokens. Captions
+and labels are gathered across DDP ranks to enlarge the negative bank. Existing
+configs keep HNSD disabled, so old checkpoints and inference are unchanged.
+
+Run the isolated CUB HNSD experiment with:
+
+```
+CUDA_VISIBLE_DEVICES=2,3 python3 -m torch.distributed.launch --nproc_per_node 2 --master_port 12348 main.py --cfg configs/MetaFG_meta_bert_1_224_hnsd.yaml --batch-size 16 --tag cub-200-hnsd --lr 5e-5 --min-lr 5e-7 --warmup-lr 5e-8 --epochs 300 --warmup-epochs 20 --dataset cub-200 --pretrain /raid/MetaFormer/pretrained_model/metafg_2_inat21_384.pth --accumulation-steps 2 --opts DATA.IMG_SIZE 384
+```
+
+The default HNSD schedule is disabled through epoch 19, linearly warmed from
+epoch 20 through epoch 39, and held at weight 0.005 afterward. Training logs
+report the positive/negative similarity gap, active ranking ratio, valid
+negative ratio, and same-class negative ratio. The last value must remain zero.
+
 note that final learning rate is total_bs/512.
 #### Eval
 To evaluate model on dataset,run:
