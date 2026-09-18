@@ -147,6 +147,11 @@ def compute_query_statistics(part_grids, top_fraction):
     peaks = [np.unravel_index(int(np.argmax(row)), (h, w)) for row in flat]
     off_diag = overlap[~np.eye(p, dtype=bool)] if p > 1 else np.asarray([1.0])
 
+    entropy = -(flat * np.log(np.clip(flat, 1e-12, None))).sum(axis=1)
+    normalized_entropy = entropy / max(np.log(float(flat.shape[1])), 1e-12)
+    total_variation_from_uniform = 0.5 * np.abs(flat - uniform).sum(axis=1)
+    peak_lift_over_uniform = flat.max(axis=1) / max(uniform, 1e-12)
+
     flat_student_reference = None
     metrics = {
         "num_parts": int(p),
@@ -157,6 +162,12 @@ def compute_query_statistics(part_grids, top_fraction):
         "min_pairwise_overlap": float(off_diag.min()),
         "max_pairwise_overlap": float(off_diag.max()),
         "mean_pairwise_divergence": float((1.0 - off_diag).mean()),
+        "mean_normalized_attention_entropy": float(normalized_entropy.mean()),
+        "min_normalized_attention_entropy": float(normalized_entropy.min()),
+        "max_normalized_attention_entropy": float(normalized_entropy.max()),
+        "mean_total_variation_from_uniform": float(total_variation_from_uniform.mean()),
+        "mean_peak_lift_over_uniform": float(peak_lift_over_uniform.mean()),
+        "max_peak_lift_over_uniform": float(peak_lift_over_uniform.max()),
         "peak_locations_yx": [[int(y), int(x)] for y, x in peaks],
         "all_peaks_identical": bool(len(set(peaks)) == 1),
     }
@@ -169,6 +180,33 @@ def compute_query_statistics(part_grids, top_fraction):
         metrics["allowed_claim"] = "inspect_per-query_maps_before_claiming_specialisation"
         metrics["forbidden_claim"] = "none_without_dataset_level_validation"
     return excess, consensus, agreement, overlap, metrics
+
+
+def _average_ranks(values):
+    """Average ranks with exact ties preserved; no SciPy dependency."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        stop = start + 1
+        while stop < values.size and sorted_values[stop] == sorted_values[start]:
+            stop += 1
+        ranks[order[start:stop]] = 0.5 * (start + stop - 1) + 1.0
+        start = stop
+    return ranks
+
+
+def tied_spearman(left, right):
+    left_rank = _average_ranks(left)
+    right_rank = _average_ranks(right)
+    left_rank -= left_rank.mean()
+    right_rank -= right_rank.mean()
+    denominator = np.linalg.norm(left_rank) * np.linalg.norm(right_rank)
+    if denominator <= 1e-12:
+        return float("nan")
+    return float(np.dot(left_rank, right_rank) / denominator)
 
 
 def overlay_evidence(image, unit_map, cmap_name, alpha):
@@ -203,7 +241,26 @@ def prepare_record(image, student_grid, part_grids, metadata, top_fraction):
         np.mean(np.isclose(student_flat, floor, rtol=0.0, atol=1e-8))
     )
     statistics["shared_part_scale_99th"] = float(shared_part_scale)
+    statistics["student_part_consensus_spearman"] = tied_spearman(
+        student_grid, consensus
+    )
     statistics.update(metadata)
+    warnings = []
+    if not statistics.get("correct", True):
+        warnings.append("misclassified_sample")
+    if statistics["mean_normalized_attention_entropy"] >= 0.98:
+        warnings.append("diffuse_part_attention")
+    correlation = statistics["student_part_consensus_spearman"]
+    if np.isfinite(correlation) and correlation <= 0.10:
+        warnings.append("weak_student_part_spatial_agreement")
+    if statistics["mean_pairwise_overlap"] >= 0.98:
+        warnings.append("query_redundancy_distinct_parts_not_supported")
+    statistics["paper_warnings"] = warnings
+    statistics["positive_main_text_ready"] = bool(
+        statistics.get("correct", True)
+        and "diffuse_part_attention" not in warnings
+        and "weak_student_part_spatial_agreement" not in warnings
+    )
     return {
         "image": image,
         "student_unit": student_unit,
@@ -217,32 +274,35 @@ def prepare_record(image, student_grid, part_grids, metadata, top_fraction):
     }
 
 
-def plot_gallery(records, output_stem, formats, alpha, layer):
+def _plot_gallery(records, output_stem, formats, alpha, panel_keys, titles, top_fraction):
     rows = len(records)
+    columns = len(panel_keys)
+    figure_width = 4.8 if columns == 2 else 7.16
     fig, axes = plt.subplots(
         rows,
-        4,
-        figsize=(7.16, max(1.72 * rows, 1.9)),
+        columns,
+        figsize=(figure_width, max(1.72 * rows, 1.9)),
         constrained_layout=True,
         squeeze=False,
     )
-    titles = [
-        "(a) Input",
-        "(b) Student importance",
-        "(c) Shared part evidence",
-        "(d) Query agreement",
-    ]
     for column, title in enumerate(titles):
-        axes[0, column].set_title(title, fontweight="semibold")
+        axes[0, column].set_title(title, fontweight="semibold", fontsize=8.2)
 
     for row, record in enumerate(records):
         image = record["image"]
-        panels = [
-            image,
-            overlay_evidence(image, record["student_unit"], CMAP_EVIDENCE, alpha),
-            overlay_evidence(image, record["consensus_unit"], CMAP_EVIDENCE, alpha),
-            overlay_evidence(image, record["agreement"], CMAP_AGREEMENT, alpha),
-        ]
+        panel_lookup = {
+            "input": image,
+            "student": overlay_evidence(
+                image, record["student_unit"], CMAP_EVIDENCE, alpha
+            ),
+            "part": overlay_evidence(
+                image, record["consensus_unit"], CMAP_EVIDENCE, alpha
+            ),
+            "agreement": overlay_evidence(
+                image, record["agreement"], CMAP_AGREEMENT, alpha
+            ),
+        }
+        panels = [panel_lookup[key] for key in panel_keys]
         for column, panel in enumerate(panels):
             axes[row, column].imshow(panel)
             axes[row, column].axis("off")
@@ -258,27 +318,90 @@ def plot_gallery(records, output_stem, formats, alpha, layer):
             bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "alpha": 0.88, "linewidth": 0},
         )
 
-    evidence_bar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=CMAP_EVIDENCE)
-    agreement_bar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=CMAP_AGREEMENT)
-    cb1 = fig.colorbar(
-        evidence_bar,
-        ax=axes[:, 1:3].ravel().tolist(),
-        orientation="horizontal",
-        fraction=0.025,
-        pad=0.015,
-        aspect=50,
-    )
-    cb1.set_label("Within-image normalized evidence", labelpad=2)
-    cb2 = fig.colorbar(
-        agreement_bar,
-        ax=axes[:, 3].ravel().tolist(),
-        orientation="horizontal",
-        fraction=0.025,
-        pad=0.015,
-        aspect=25,
-    )
-    cb2.set_label("Fraction of agreeing queries", labelpad=2)
+    evidence_columns = [
+        index for index, key in enumerate(panel_keys) if key in {"student", "part"}
+    ]
+    if evidence_columns:
+        evidence_bar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=CMAP_EVIDENCE)
+        cb1 = fig.colorbar(
+            evidence_bar,
+            ax=axes[:, evidence_columns].ravel().tolist(),
+            orientation="horizontal",
+            fraction=0.025,
+            pad=0.015,
+            aspect=50,
+        )
+        cb1.set_label("Within-image normalized evidence", labelpad=2)
+    agreement_columns = [
+        index for index, key in enumerate(panel_keys) if key == "agreement"
+    ]
+    if agreement_columns:
+        agreement_bar = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=CMAP_AGREEMENT)
+        cb2 = fig.colorbar(
+            agreement_bar,
+            ax=axes[:, agreement_columns].ravel().tolist(),
+            orientation="horizontal",
+            fraction=0.025,
+            pad=0.015,
+            aspect=25,
+        )
+        cb2.set_label(
+            "Query consensus fraction (top {:.0f}%)".format(
+                100.0 * float(top_fraction)
+            ),
+            labelpad=2,
+        )
     save_figure(fig, output_stem, formats)
+
+
+def plot_main_gallery(records, output_stem, formats, alpha, top_fraction):
+    """Compact main-text candidate without the diagnostic agreement column."""
+    _plot_gallery(
+        records,
+        output_stem,
+        formats,
+        alpha,
+        ("input", "student", "part"),
+        ("(a) Input", "(b) Student importance", "(c) Shared part evidence"),
+        top_fraction,
+    )
+
+
+def plot_gallery(records, output_stem, formats, alpha, layer, top_fraction=0.10):
+    """Full four-column analysis, retained for backward compatibility."""
+    agreement_title = "(d) Query consensus\n(top {:.0f}%)".format(
+        100.0 * float(top_fraction)
+    )
+    _plot_gallery(
+        records,
+        output_stem,
+        formats,
+        alpha,
+        ("input", "student", "part", "agreement"),
+        (
+            "(a) Input",
+            "(b) Student importance",
+            "(c) Shared part evidence",
+            agreement_title,
+        ),
+        top_fraction,
+    )
+
+
+def plot_query_consensus_gallery(records, output_stem, formats, alpha, top_fraction):
+    """Large two-column comparison for judging query-consensus readability."""
+    agreement_title = "(b) Query consensus (top {:.0f}%)".format(
+        100.0 * float(top_fraction)
+    )
+    _plot_gallery(
+        records,
+        output_stem,
+        formats,
+        alpha,
+        ("input", "agreement"),
+        ("(a) Input", agreement_title),
+        top_fraction,
+    )
 
 
 def plot_query_diagnostics(record, output_stem, formats, alpha):
@@ -427,11 +550,14 @@ def run(args):
         status = record["metrics"]["interpretation_status"]
         overlap = record["metrics"]["mean_pairwise_overlap"]
         print(
-            "[sample {:04d}] correct={} confidence={:.4f} overlap={:.6f} status={}".format(
+            "[sample {:04d}] correct={} confidence={:.4f} overlap={:.6f} "
+            "entropy={:.6f} student-part-rho={:.4f} status={}".format(
                 sample_index,
                 record["metrics"]["correct"],
                 record["metrics"]["confidence"],
                 overlap,
+                record["metrics"]["mean_normalized_attention_entropy"],
+                record["metrics"]["student_part_consensus_spearman"],
                 status,
             )
         )
@@ -440,6 +566,8 @@ def run(args):
                 "[warning] Part queries are nearly identical; report shared evidence consensus, "
                 "not distinct anatomical parts."
             )
+        for warning in record["metrics"]["paper_warnings"]:
+            print("[paper-warning] sample {:04d}: {}".format(sample_index, warning))
         if args.diagnostics:
             plot_query_diagnostics(
                 record,
@@ -448,12 +576,31 @@ def run(args):
                 args.overlay_alpha,
             )
 
+    # Produce both choices requested for paper review.  The compact version is
+    # the default main-text candidate; the full version preserves the query
+    # consensus diagnostic; the two-column version makes that diagnostic easy
+    # to judge without shrinking it into a four-column grid.
+    plot_main_gallery(
+        records,
+        output_dir / "visual_analysis_main_layer{}".format(args.layer),
+        args.formats,
+        args.overlay_alpha,
+        args.top_fraction,
+    )
     plot_gallery(
         records,
-        output_dir / "visual_analysis_layer{}".format(args.layer),
+        output_dir / "visual_analysis_with_query_consensus_layer{}".format(args.layer),
         args.formats,
         args.overlay_alpha,
         args.layer,
+        args.top_fraction,
+    )
+    plot_query_consensus_gallery(
+        records,
+        output_dir / "query_consensus_layer{}".format(args.layer),
+        args.formats,
+        args.overlay_alpha,
+        args.top_fraction,
     )
     report = {
         "checkpoint": str(args.checkpoint),
@@ -462,12 +609,19 @@ def run(args):
         "normalization": {
             "student": "positive response above the within-image minimum; 99th-percentile scale",
             "part": "positive attention mass above the uniform 1/N reference; 99th-percentile scale",
-            "agreement": "fraction of queries whose location lies in that query's top fraction",
+            "agreement": "fraction of queries whose location lies in that query's top fraction; spatial consensus only, not evidence magnitude",
         },
         "paper_policy": {
             "teacher_student_single_image": "excluded; use dataset-level fig:distillation_fidelity",
             "semantic_position_heatmap": "excluded; exact tokenizer labels and padding mask required",
             "high_overlap": "consensus evidence only; never claim distinct parts",
+            "query_consensus": "interpret jointly with shared part evidence; top-k membership alone does not encode attention magnitude",
+            "positive_examples": "do not use misclassified or quality-flagged samples as positive main-text evidence",
+        },
+        "outputs": {
+            "main_text_candidate": "visual_analysis_main_layer{}".format(args.layer),
+            "full_diagnostic": "visual_analysis_with_query_consensus_layer{}".format(args.layer),
+            "query_consensus_standalone": "query_consensus_layer{}".format(args.layer),
         },
         "samples": [record["metrics"] for record in records],
     }
