@@ -135,39 +135,36 @@ Results in iNaturalist 2019, iNaturalist 2018, and iNaturalist 2021 with meta-in
 ## Acknowledgement
 Many thanks for [swin-transformer](https://github.com/microsoft/Swin-Transformer).A part of the code is borrowed from it.
 
-## Curv-Part 论文可视化（独立目录）
+## Curv-Part 论文可视化 v2
 
-新增的投稿级可视化代码位于 [`paper_visualization/`](paper_visualization/)，
-与原有训练和推理脚本分离，不会修改模型权重或训练流程。它直接读取模型返回的
-真实 Part attention、Student/HVP curvature 和语义接地权重，生成 PNG 300 DPI
-与 PDF 矢量图。
+论文可视化位于 [`paper_visualization/`](paper_visualization/)。v2 将 Teacher--Student
+保真度留给完整测试集的 `fig:distillation_fidelity`，不再用单个随机 HVP 样本重复
+论证；正文图只展示推理阶段 Student importance、共享 Part evidence 和 query agreement。
 
-先执行绘图与颜色规范自检：
+先执行自检：
 
 ```bash
 cd /raid/viz/MetaFormer_viz
-python3 paper_visualization/self_check.py \
-  --output-dir paper_visualization/outputs/self_check
+python3 paper_visualization/self_check_v2.py \\
+  --output-dir paper_visualization/outputs/self_check_v2
 ```
 
-使用 CUB 检查点生成 Layer-2 论文图：
+生成 Layer-2 多样本正文候选图：
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 python3 \
-  paper_visualization/visualize_part_evidence.py \
-  --cfg configs/MetaFG_meta_bert_1_224.yaml \
-  --checkpoint output/MetaFG_meta_2/cub-200vis/best.pth \
-  --dataset cub-200 \
-  --data-root /raid/datasets/cub-200 \
-  --sample-index 0 \
-  --caption-index 0 \
-  --img-size 384 \
-  --layer 2 \
-  --device cuda:0 \
-  --force-hvp \
-  --hvp-layer 2 \
-  --output-dir paper_visualization/outputs/cub_sample_0000
+CUDA_VISIBLE_DEVICES=2 python3 \\
+  paper_visualization/visualize_evidence_consensus.py \\
+  --cfg configs/MetaFG_meta_bert_1_224.yaml \\
+  --checkpoint output/MetaFG_meta_2/cub-200-vis/best.pth \\
+  --dataset cub-200 \\
+  --data-root /raid/datasets/cub-200 \\
+  --sample-indices 0 1000 2000 3000 \\
+  --caption-index 0 \\
+  --img-size 384 \\
+  --layer 2 \\
+  --device cuda:0 \\
+  --output-dir paper_visualization/outputs/paper_layer2
 ```
 
-输出文件、Layer-1 命令、颜色规范和 Part 重叠指标解释见
+完整输出说明、Layer-1 诊断命令、颜色规范及允许/禁止的论文表述见
 [`paper_visualization/README.md`](paper_visualization/README.md)。
