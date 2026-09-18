@@ -26,13 +26,17 @@ layer*_semantic_grounding.*
 layer*_part_overlap.*
 ```
 
-## v2 的论文图
+## v2.1：同一次运行输出三套图
 
 `visualize_evidence_consensus.py` 默认不计算 HVP，只使用部署阶段真实存在的 Student
 和最终 Part attention，输出：
 
-- `visual_analysis_layer2.png/.pdf`：正文候选图；每行一个固定样本，四列依次为输入、
-  Student importance、共享 Part evidence、query agreement；
+- `visual_analysis_main_layer2.png/.pdf`：三列正文候选版，依次为输入、Student
+  importance、共享 Part evidence；
+- `visual_analysis_with_query_consensus_layer2.png/.pdf`：四列完整分析版，在前三列后
+  增加 `Top-10% query consensus`；
+- `query_consensus_layer2.png/.pdf`：两列放大比较版，只显示输入与 query consensus，
+  用于判断该信息是否值得进入正文；
 - `sample_XXXX_layer2_maps.npz`：原始图与计算后的二维数组；
 - `visual_analysis_metrics.json`：重叠、峰值、警告和允许/禁止的论文表述；
 - 加 `--diagnostics` 后额外输出 8 个 Part queries 和 query divergence，建议放补充材料
@@ -45,6 +49,10 @@ evidence_p(i) = max(A_p(i) - 1/N, 0)
 ```
 
 即只显示高于均匀注意力 `1/N` 的正增益，避免把近似均匀的 softmax 背景画得很亮。
+
+`Top-10% query consensus` 定义为：对每个 query 取响应最高的 10% 位置，再统计每个
+位置被多少比例的 queries 同时选中。它只编码**空间共识**，不编码注意力绝对强度，
+因此必须与 `Shared part evidence` 联合解释，不能单独证明该区域具有很强的分类贡献。
 
 ## 1. 更新代码后先自检
 
@@ -87,6 +95,22 @@ CUDA_VISIBLE_DEVICES=2 python3 \
 这条命令不会重复计算 HVP Teacher，因为 Teacher--Student fidelity 已由完整测试集实验
 负责。它也不会修改模型参数或 checkpoint。
 
+运行一次后直接比较以下三个 PDF：
+
+```text
+paper_visualization/outputs/paper_layer2/visual_analysis_main_layer2.pdf
+paper_visualization/outputs/paper_layer2/visual_analysis_with_query_consensus_layer2.pdf
+paper_visualization/outputs/paper_layer2/query_consensus_layer2.pdf
+```
+
+正文选择原则：
+
+- 若论文只需要说明 Student importance 如何传递为最终共享证据，优先三列版；
+- 若正文主张“多个 queries 共同确认同一区域”，使用四列版，但必须写成
+  `query consensus/redundancy`，不能写成 `part diversity`；
+- 两列放大版主要用于作者检查或补充材料，不建议单独作为正文主图，因为 top-k
+  consensus 不包含响应幅值。
+
 ## 3. Layer 1 与 8-query 诊断
 
 ```bash
@@ -125,6 +149,33 @@ overlap(p,q) = sum_i min(A_p(i), A_q(i))
 同时也是明显的 query 冗余。它可以用来说明眼部/喙部证据被多个 queries 重复确认，
 但不能证明 8 个 Part 学到了不同区域。
 
+## 自动论文质量告警
+
+`visual_analysis_metrics.json` 与终端日志额外给出：
+
+- `mean_normalized_attention_entropy`：越接近 1，注意力整体越扩散；
+- `student_part_consensus_spearman`：Student importance 与共享 Part evidence 的
+  tie-aware Spearman 空间相关；
+- `paper_warnings`：误分类、过度扩散、Student--Part 空间一致性弱、query 高冗余；
+- `positive_main_text_ready`：仅是保守的筛查标志，不能代替人工核验。
+
+误分类样本可以放 failure cases，但不能作为正文中的成功案例。样本编号应按预先声明的
+规则固定（例如固定索引或类别分层抽样），不要看完热图后只挑最漂亮的样本。
+
+## 顶刊正文还应补的一张因果可视化
+
+现有图回答“模型看哪里”，但不能单凭热图证明这些位置导致预测。最有价值的补充是同一
+图像、同一 checkpoint 的四列对照：
+
+```text
+Input | Full curvature | Uniform curvature | Shuffled curvature
+```
+
+并在每列同时报告目标类别概率变化。该图应与数据集级 Uniform/Shuffle 准确率表配套。
+如果 Full、Uniform、Shuffle 的概率和空间证据几乎相同，应如实报告干预效应较弱，不能
+仅凭颜色差异宣称因果作用。`fig:distillation_fidelity` 已经回答 Student 是否学习到
+Teacher，不需要再增加单图 Teacher--Student 热图。
+
 ## 颜色和排版自检
 
 - evidence：`inferno`；agreement：`viridis`；divergence：`cividis`；
@@ -140,9 +191,9 @@ overlap(p,q) = sum_i min(A_p(i), A_q(i))
 \paragraph{Visual analysis.}
 Figure~\ref{fig:visual_analysis} visualizes the inference-time student
 importance and the spatial evidence aggregated by the learned part queries.
-The student responses concentrate on localized fine-grained cues, while the
-query-agreement maps reveal whether multiple queries repeatedly support the
-same evidence. For highly overlapping queries, we interpret the response as
+The student responses identify candidate fine-grained cues, while the
+top-response query-consensus maps reveal whether multiple queries repeatedly
+select the same locations. For highly overlapping queries, we interpret the response as
 evidence consensus rather than part diversity: several queries confirm the
 same discriminative region, but this does not imply that they recover distinct
 anatomical parts. This interpretation is consistent with the causal
@@ -156,6 +207,6 @@ of the predicted importance is functionally used by the classifier.
 \caption{Visual analysis of inference-time evidence. From left to right:
 input image, student-predicted token importance, part evidence above the
 uniform-attention reference, and the fraction of part queries selecting each
-location among their top responses. High query agreement is interpreted as
+location among their top 10\% responses. High query consensus is interpreted as
 shared evidence consensus, not necessarily as distinct part discovery.}
 ```
