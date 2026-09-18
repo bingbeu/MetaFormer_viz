@@ -187,14 +187,22 @@ def prepare_record(image, student_grid, part_grids, metadata, top_fraction):
     )
     student_unit = robust_unit_map(student_grid)
     consensus_unit = robust_unit_map(consensus, baseline=0.0)
-    part_unit = np.asarray(
-        [robust_unit_map(part_map, baseline=0.0) for part_map in excess]
-    )
+    # One shared scale across all queries prevents per-panel normalization from
+    # exaggerating weak queries or manufacturing apparent diversity.
+    positive_part = excess[excess > 0]
+    if positive_part.size:
+        shared_part_scale = float(np.percentile(positive_part, 99.0))
+        shared_part_scale = max(shared_part_scale, 1e-12)
+        part_unit = np.clip(excess / shared_part_scale, 0.0, 1.0)
+    else:
+        shared_part_scale = 0.0
+        part_unit = np.zeros_like(excess, dtype=np.float64)
     student_flat = np.asarray(student_grid).reshape(-1)
     floor = float(student_flat.min())
     statistics["student_floor_fraction"] = float(
         np.mean(np.isclose(student_flat, floor, rtol=0.0, atol=1e-8))
     )
+    statistics["shared_part_scale_99th"] = float(shared_part_scale)
     statistics.update(metadata)
     return {
         "image": image,
