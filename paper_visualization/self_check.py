@@ -5,7 +5,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import matplotlib
 import numpy as np
 
 
@@ -24,6 +23,7 @@ from paper_visualization.visualize_part_evidence import (  # noqa: E402
     plot_part_evidence,
     plot_semantic_grounding,
     plot_teacher_student,
+    validate_colormaps,
 )
 
 
@@ -45,9 +45,8 @@ def main():
     expected = {CMAP_ATTENTION, CMAP_AGREEMENT, CMAP_DIFFERENCE, CMAP_MATRIX}
     if expected != ALLOWED_CMAPS:
         raise AssertionError("Colormap policy is internally inconsistent")
+    validate_colormaps()
     for cmap in ALLOWED_CMAPS:
-        if cmap not in matplotlib.colormaps:
-            raise AssertionError("Unavailable colormap: {}".format(cmap))
         if cmap.lower() in {"jet", "rainbow", "gist_rainbow", "nipy_spectral"}:
             raise AssertionError("Non-publication colormap configured: {}".format(cmap))
 

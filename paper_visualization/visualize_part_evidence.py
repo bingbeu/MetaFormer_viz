@@ -73,6 +73,21 @@ def configure_publication_style():
     )
 
 
+def get_colormap(name):
+    """Return a colormap on both recent and legacy Matplotlib versions."""
+    if hasattr(matplotlib, "colormaps"):
+        return matplotlib.colormaps[name]
+    return plt.get_cmap(name)
+
+
+def validate_colormaps():
+    for name in ALLOWED_CMAPS:
+        try:
+            get_colormap(name)
+        except ValueError as error:
+            raise RuntimeError("Configured publication colormap is unavailable: {}".format(name)) from error
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Visualize Curv-Part curvature, part evidence, and grounding."
@@ -281,7 +296,7 @@ def overlay_heatmap(image, heatmap, cmap, alpha, vmin, vmax):
     height, width = image.shape[:2]
     heatmap = resize_heatmap(heatmap, height, width)
     normalized = np.clip((heatmap - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
-    colour = matplotlib.colormaps[cmap](normalized)[..., :3]
+    colour = get_colormap(cmap)(normalized)[..., :3]
     # Heat-dependent transparency preserves the underlying image in low-response
     # regions and avoids painting the complete background with the colormap.
     blend = (float(alpha) * normalized)[..., None]
@@ -520,8 +535,7 @@ def run_visualization(args):
         raise ValueError("top-fraction must be in (0, 1]")
     if not 0.0 <= args.overlay_alpha <= 1.0:
         raise ValueError("overlay-alpha must be in [0, 1]")
-    if any(cmap not in matplotlib.colormaps for cmap in ALLOWED_CMAPS):
-        raise RuntimeError("Configured publication colormap is unavailable")
+    validate_colormaps()
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
