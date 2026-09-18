@@ -18,6 +18,8 @@ from paper_visualization.visualize_evidence_consensus import (
     _cmap,
     configure_publication_style,
     plot_gallery,
+    plot_main_gallery,
+    plot_query_consensus_gallery,
     plot_query_diagnostics,
     prepare_record,
     robust_unit_map,
@@ -100,21 +102,41 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_gallery(
-        [record], output_dir / "visual_analysis_layer2", ("png", "pdf"), 0.72, 2
+        [record],
+        output_dir / "visual_analysis_with_query_consensus_layer2",
+        ("png", "pdf"),
+        0.72,
+        2,
+        0.10,
+    )
+    plot_main_gallery(
+        [record], output_dir / "visual_analysis_main_layer2", ("png", "pdf"), 0.72, 0.10
+    )
+    plot_query_consensus_gallery(
+        [record], output_dir / "query_consensus_layer2", ("png", "pdf"), 0.72, 0.10
     )
     plot_query_diagnostics(
         record, output_dir / "sample_0000_layer2", ("png", "pdf"), 0.72
     )
     expected = [
-        output_dir / "visual_analysis_layer2.png",
-        output_dir / "visual_analysis_layer2.pdf",
+        output_dir / "visual_analysis_main_layer2.png",
+        output_dir / "visual_analysis_main_layer2.pdf",
+        output_dir / "visual_analysis_with_query_consensus_layer2.png",
+        output_dir / "visual_analysis_with_query_consensus_layer2.pdf",
+        output_dir / "query_consensus_layer2.png",
+        output_dir / "query_consensus_layer2.pdf",
         output_dir / "sample_0000_layer2_part_queries.png",
         output_dir / "sample_0000_layer2_query_divergence.png",
     ]
     for path in expected:
         if not path.exists() or path.stat().st_size < 1000:
             raise AssertionError("Missing or empty output: {}".format(path))
+    if "mean_normalized_attention_entropy" not in record["metrics"]:
+        raise AssertionError("Missing normalized attention entropy")
+    if "student_part_consensus_spearman" not in record["metrics"]:
+        raise AssertionError("Missing Student--Part spatial agreement")
     print("[PASS] tied-value, attention-reference, metric, colour, and render checks")
+    print("[PASS] main, full-query-consensus, and standalone-query-consensus layouts")
     print("[PASS] preview directory: {}".format(output_dir.resolve()))
 
 
