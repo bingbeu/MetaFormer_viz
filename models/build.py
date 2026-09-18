@@ -17,18 +17,23 @@ _CATEGORY_BANK = {
 def build_model(config):
     model_type = config.MODEL.TYPE
     if model_type == 'MetaFG':
-        model = create_model(
-                config.MODEL.NAME,
-                pretrained=False,
-                num_classes=config.MODEL.NUM_CLASSES, 
-                drop_path_rate=config.MODEL.DROP_PATH_RATE,
-                img_size=config.DATA.IMG_SIZE,
-                only_last_cls=config.MODEL.ONLY_LAST_CLS,
-                extra_token_num=config.MODEL.EXTRA_TOKEN_NUM,
-                meta_dims=config.MODEL.META_DIMS,
-                category_emb_path=_CATEGORY_BANK.get(config.DATA.DATASET),
-                assess=config.MODEL.assess
+        model_kwargs = dict(
+            pretrained=False,
+            num_classes=config.MODEL.NUM_CLASSES,
+            drop_path_rate=config.MODEL.DROP_PATH_RATE,
+            img_size=config.DATA.IMG_SIZE,
+            only_last_cls=config.MODEL.ONLY_LAST_CLS,
+            extra_token_num=config.MODEL.EXTRA_TOKEN_NUM,
+            meta_dims=config.MODEL.META_DIMS,
+            category_emb_path=_CATEGORY_BANK.get(config.DATA.DATASET),
+            assess=config.MODEL.assess,
         )
+        if config.MODEL.NAME.startswith('MetaFG_meta'):
+            model_kwargs.update(
+                enable_hnsd=config.MODEL.HNSD_ENABLE,
+                hnsd_margin=config.MODEL.HNSD_MARGIN,
+            )
+        model = create_model(config.MODEL.NAME, **model_kwargs)
     else:
         raise NotImplementedError(f"Unkown model: {model_type}")
 
