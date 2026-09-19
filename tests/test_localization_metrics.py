@@ -2,9 +2,11 @@ import numpy as np
 
 from localization_metrics import (
     box_iou_from_masks,
+    evaluate_evidence_consensus,
     evaluate_heatmap,
     evaluate_part_points,
     pointing_game,
+    square_deletion_mask,
     top_fraction_mask,
 )
 
@@ -46,3 +48,24 @@ def test_part_matching_perfect():
     assert result["matched_mean_nme"] == 0.0
     assert result["matched_pck_0p1"] == 1.0
     assert result["gt_coverage_pck_0p1"] == 1.0
+
+
+def test_evidence_consensus_allows_shared_peaks():
+    maps = np.zeros((4, 2, 2), dtype=float)
+    maps[:3, 0, 1] = 1.0
+    maps[3, 1, 0] = 1.0
+    foreground = np.zeros((8, 8), dtype=bool)
+    foreground[:4, 4:] = True
+    result = evaluate_evidence_consensus(maps, foreground)
+    assert result["consensus_ratio"] == 0.75
+    assert result["unique_peak_ratio"] == 0.5
+    assert result["consensus_foreground_hit"] == 1.0
+    assert result["consensus_x"] == 6.0
+    assert result["consensus_y"] == 2.0
+
+
+def test_square_deletion_mask_keeps_constant_area_at_border():
+    mask = square_deletion_mask((10, 10), (0.0, 0.0), side_fraction=0.4)
+    assert mask.shape == (10, 10)
+    assert int(mask.sum()) == 16
+    assert mask[0, 0]
