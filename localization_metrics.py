@@ -187,9 +187,9 @@ def evaluate_part_points(
     if len(pred) > 1:
         pairwise = np.linalg.norm(pred[:, None, :] - pred[None, :, :], axis=-1)
         upper = pairwise[np.triu_indices(len(pred), k=1)] / float(normalization_length)
-        out["part_pairwise_distance"] = float(upper.mean())
+        out["pairwise_distance"] = float(upper.mean())
     else:
-        out["part_pairwise_distance"] = float("nan")
+        out["pairwise_distance"] = float("nan")
     rounded = np.round(pred, decimals=4)
-    out["part_unique_peak_ratio"] = float(len(np.unique(rounded, axis=0)) / len(pred))
+    out["unique_peak_ratio"] = float(len(np.unique(rounded, axis=0)) / len(pred))
     return out
