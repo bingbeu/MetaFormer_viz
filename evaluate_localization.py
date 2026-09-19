@@ -5,8 +5,10 @@ Metrics:
   * top-fraction pixel IoU and predicted-box IoU
   * foreground energy concentration and area-normalized concentration gain
   * top-k foreground precision
-  * Hungarian-matched part NME/PCK, GT-part coverage, predicted-part precision,
-    and part-peak diversity using CUB's visible part keypoints
+  * Hungarian-matched part NME/PCK and GT-part coverage (diagnostic only)
+  * unconstrained Softmax evidence-token consensus and border bias
+  * optional causal deletion against matched random foreground/background
+  * optional horizontal-flip consensus stability
 
 The script uses ``part_attn`` (the pre-dropout attention that actually forms
 part tokens), not ``part_assign`` (semantic token-to-part compatibility).
@@ -33,9 +35,11 @@ from torch.utils.data import DataLoader
 
 from localization_metrics import (
     evaluate_heatmap,
+    evaluate_evidence_consensus,
     evaluate_part_points,
     foreground_energy_fraction,
     part_peak_points,
+    square_deletion_mask,
 )
 from visualize import build_loader, build_model, load_config
 
@@ -87,6 +91,24 @@ def parse_args():
              "Without this option, foreground metrics use official CUB boxes.",
     )
     parser.add_argument("--save-overlays", type=int, default=20)
+    parser.add_argument(
+        "--causal-deletion",
+        action="store_true",
+        help="Mask the consensus evidence patch and compare confidence drops with random foreground/background patches.",
+    )
+    parser.add_argument(
+        "--deletion-size",
+        type=float,
+        default=0.15,
+        help="Side length of the square deletion patch as a fraction of image size.",
+    )
+    parser.add_argument("--deletion-random-samples", type=int, default=5)
+    parser.add_argument("--deletion-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--flip-stability",
+        action="store_true",
+        help="Measure consensus-peak stability under a horizontal flip.",
+    )
     return parser.parse_args()
 
 
@@ -123,6 +145,108 @@ def find_aux(output):
             if isinstance(item, dict):
                 return item
     raise RuntimeError("model output does not contain an auxiliary dictionary")
+
+
+def find_logits(output):
+    if torch.is_tensor(output) and output.ndim == 2:
+        return output
+    if isinstance(output, (tuple, list)):
+        for item in output:
+            if torch.is_tensor(item) and item.ndim == 2:
+                return item
+    raise RuntimeError("model output does not contain [B,C] classification logits")
+
+
+def random_points_from_mask(mask, count, rng):
+    ys, xs = np.nonzero(np.asarray(mask, dtype=bool))
+    if len(xs) == 0 or count <= 0:
+        return []
+    ids = rng.integers(0, len(xs), size=count)
+    return [(float(xs[i]) + 0.5, float(ys[i]) + 0.5) for i in ids]
+
+
+def causal_deletion_metrics(
+    model,
+    image,
+    meta_sample,
+    original_logits,
+    target,
+    consensus_point,
+    foreground,
+    deletion_size,
+    random_samples,
+    deletion_batch_size,
+    rng,
+):
+    """Compare a consensus-evidence deletion with matched random patches."""
+    _, _, height, width = image.shape
+    centers = [("consensus", consensus_point)]
+    centers.extend(
+        ("random_foreground", p)
+        for p in random_points_from_mask(foreground, random_samples, rng)
+    )
+    centers.extend(
+        ("random_background", p)
+        for p in random_points_from_mask(~np.asarray(foreground, dtype=bool), random_samples, rng)
+    )
+
+    variants = image.repeat(len(centers), 1, 1, 1).clone()
+    for index, (_kind, point) in enumerate(centers):
+        deletion = square_deletion_mask((height, width), point, deletion_size)
+        deletion = torch.from_numpy(deletion).to(device=image.device)
+        # Inputs are ImageNet-normalized, so zero is the channel-wise mean.
+        variants[index, :, deletion] = 0.0
+
+    masked_logits = []
+    previous_assess = getattr(model, "assess", None)
+    if previous_assess is not None:
+        model.assess = False
+    try:
+        with torch.no_grad():
+            for start in range(0, len(variants), max(1, deletion_batch_size)):
+                stop = min(start + max(1, deletion_batch_size), len(variants))
+                meta_chunk = None
+                if meta_sample is not None:
+                    repeats = [stop - start] + [1] * (meta_sample.ndim - 1)
+                    meta_chunk = meta_sample.repeat(*repeats)
+                output = model(variants[start:stop], meta_chunk, return_aux=False)
+                masked_logits.append(find_logits(output).detach())
+    finally:
+        if previous_assess is not None:
+            model.assess = previous_assess
+
+    masked_logits = torch.cat(masked_logits, dim=0)
+    original_logits = original_logits.detach().float()
+    original_prob = torch.softmax(original_logits, dim=-1)
+    masked_prob = torch.softmax(masked_logits.float(), dim=-1)
+    target = int(target)
+    predicted = int(original_logits.argmax())
+
+    result = {
+        "causal_original_target_probability": float(original_prob[target]),
+        "causal_original_predicted_probability": float(original_prob[predicted]),
+        "causal_original_correct": float(predicted == target),
+    }
+    grouped = defaultdict(list)
+    for index, (kind, _point) in enumerate(centers):
+        grouped[kind].append(index)
+
+    for kind, ids in grouped.items():
+        target_prob = masked_prob[ids, target].mean()
+        pred_prob = masked_prob[ids, predicted].mean()
+        target_logit = masked_logits[ids, target].mean()
+        result[f"causal_{kind}_target_probability_drop"] = float(original_prob[target] - target_prob)
+        result[f"causal_{kind}_predicted_probability_drop"] = float(original_prob[predicted] - pred_prob)
+        result[f"causal_{kind}_target_logit_drop"] = float(original_logits[target] - target_logit)
+
+    consensus_drop = result["causal_consensus_target_probability_drop"]
+    for baseline in ("random_foreground", "random_background"):
+        key = f"causal_{baseline}_target_probability_drop"
+        if key in result:
+            result[f"causal_consensus_minus_{baseline}_target_probability_drop"] = (
+                consensus_drop - result[key]
+            )
+    return result
 
 
 def find_cub_root(dataset) -> Path:
@@ -286,7 +410,7 @@ def input_tensor_to_pil(image_tensor):
     return Image.fromarray(array, mode="RGB")
 
 
-def save_overlay(path, evaluation_image, heatmap, box_mask, gt_parts, pred_parts):
+def save_overlay(path, evaluation_image, heatmap, box_mask, gt_parts, pred_parts, consensus_point=None):
     image = evaluation_image.convert("RGB")
     h = heatmap.astype(np.float64)
     h = (h - h.min()) / max(float(h.max() - h.min()), 1e-12)
@@ -304,6 +428,9 @@ def save_overlay(path, evaluation_image, heatmap, box_mask, gt_parts, pred_parts
     for x, y in pred_parts:
         draw.line((x - 4, y, x + 4, y), fill="yellow", width=2)
         draw.line((x, y - 4, x, y + 4), fill="yellow", width=2)
+    if consensus_point is not None:
+        x, y = consensus_point
+        draw.ellipse((x - 7, y - 7, x + 7, y + 7), outline="magenta", width=3)
     image.convert("RGB").save(path, quality=95)
 
 
@@ -349,6 +476,12 @@ def main():
     args = parse_args()
     if not 0.0 < args.top_fraction <= 1.0:
         raise ValueError("--top-fraction must be in (0,1]")
+    if not 0.0 < args.deletion_size <= 1.0:
+        raise ValueError("--deletion-size must be in (0,1]")
+    if args.deletion_random_samples < 1:
+        raise ValueError("--deletion-random-samples must be at least 1")
+    if args.deletion_batch_size < 1:
+        raise ValueError("--deletion-batch-size must be at least 1")
     set_deterministic(args.seed)
     init_single_process_group()
     output_dir = Path(args.out)
@@ -421,10 +554,26 @@ def main():
                 force_hvp=use_hvp,
                 force_hvp_layer=args.layer if use_hvp else None,
             )
+        logits = find_logits(output)
         aux = find_aux(output)
         part_attention = aux.get(f"part_attn_{args.layer}")
         if part_attention is None:
             raise KeyError(f"missing part_attn_{args.layer}; update MetaFG_meta.py to expose pre-dropout part attention")
+
+        flipped_part_attention = None
+        if args.flip_stability:
+            with torch.no_grad():
+                flipped_output = model(
+                    torch.flip(images, dims=[-1]),
+                    meta,
+                    return_aux=True,
+                    force_hvp=False,
+                    force_hvp_layer=None,
+                )
+            flipped_aux = find_aux(flipped_output)
+            flipped_part_attention = flipped_aux.get(f"part_attn_{args.layer}")
+            if flipped_part_attention is None:
+                raise KeyError(f"missing flipped part_attn_{args.layer}")
 
         for local_index in range(images.shape[0]):
             if args.max_images and global_index >= args.max_images:
@@ -447,6 +596,13 @@ def main():
 
             part_maps = part_tensor_to_maps(part_attention, local_index)
             pred_parts = part_peak_points(part_maps, (image_size, image_size))
+            evidence = evaluate_evidence_consensus(
+                part_maps,
+                foreground,
+                gt_points=gt_parts,
+                normalization_length=box_diagonal,
+            )
+            consensus_point = (evidence["consensus_x"], evidence["consensus_y"])
             row = {
                 "image_id": image_id,
                 "image": relative_path,
@@ -455,6 +611,22 @@ def main():
                 "foreground_kind": foreground_kind,
                 "visible_parts": int(len(gt_parts)),
             }
+            row.update({f"evidence_{key}": value for key, value in evidence.items()})
+
+            if flipped_part_attention is not None:
+                flipped_maps = part_tensor_to_maps(flipped_part_attention, local_index)
+                flipped_evidence = evaluate_evidence_consensus(
+                    flipped_maps,
+                    np.fliplr(foreground),
+                )
+                reflected_x = image_size - flipped_evidence["consensus_x"]
+                reflected_y = flipped_evidence["consensus_y"]
+                distance = math.hypot(
+                    consensus_point[0] - reflected_x,
+                    consensus_point[1] - reflected_y,
+                )
+                row["evidence_flip_stability_nme"] = distance / (math.sqrt(2.0) * image_size)
+                row["evidence_flip_consensus_ratio"] = flipped_evidence["consensus_ratio"]
 
             source_maps = {}
             for source in args.map_sources:
@@ -482,6 +654,23 @@ def main():
                 per_part_energy.append(foreground_energy_fraction(dense_part, foreground))
             row["part_foreground_energy_mean"] = float(np.nanmean(per_part_energy))
             row["part_foreground_energy_min"] = float(np.nanmin(per_part_energy))
+
+            if args.causal_deletion:
+                meta_sample = None if meta is None else meta[local_index:local_index + 1]
+                rng = np.random.default_rng(args.seed + 1009 * image_id + 17 * args.layer)
+                row.update(causal_deletion_metrics(
+                    model=model,
+                    image=images[local_index:local_index + 1],
+                    meta_sample=meta_sample,
+                    original_logits=logits[local_index],
+                    target=int(targets[local_index]),
+                    consensus_point=consensus_point,
+                    foreground=foreground,
+                    deletion_size=args.deletion_size,
+                    random_samples=args.deletion_random_samples,
+                    deletion_batch_size=args.deletion_batch_size,
+                    rng=rng,
+                ))
             rows.append(row)
 
             if global_index < args.save_overlays:
@@ -493,6 +682,7 @@ def main():
                     box_mask,
                     gt_parts,
                     pred_parts,
+                    consensus_point=consensus_point,
                 )
             global_index += 1
 
@@ -510,6 +700,15 @@ def main():
                 "foreground_default": "custom segmentation mask when available, otherwise CUB bounding box",
                 "iou_definition": f"exact top-{args.top_fraction:.0%} pixels; pred_box_iou is the tight box around them",
                 "part_attention_definition": "pre-dropout attention used to form part tokens",
+                "evidence_consensus_definition": (
+                    "modal spatial peak across unconstrained Softmax evidence tokens; "
+                    "agreement is descriptive and is not treated as a diversity objective"
+                ),
+                "causal_deletion_definition": (
+                    "target/predicted-class confidence drop after masking a fixed-area consensus patch; "
+                    "positive consensus-minus-random values support causal discriminativeness"
+                ),
+                "flip_stability_definition": "distance between original and inverse-flipped consensus peaks, normalized by image diagonal",
                 "metrics": summary,
             },
             handle,
