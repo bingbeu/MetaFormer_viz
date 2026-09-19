@@ -114,3 +114,39 @@ Results in iNaturalist 2019, iNaturalist 2018, and iNaturalist 2021 with meta-in
 
 ## Acknowledgement
 Many thanks for [swin-transformer](https://github.com/microsoft/Swin-Transformer).A part of the code is borrowed from it.
+
+#### Quantitative localization evaluation (CUB-200-2011)
+
+`evaluate_localization.py` evaluates the deployable curvature student and the
+actual pre-dropout attention used to form part tokens against the official CUB
+bounding boxes and visible part keypoints. It reports pointing-game accuracy,
+top-fraction pixel IoU, predicted-box IoU, IoU@0.5 localization accuracy,
+foreground energy/concentration, top-k foreground precision, Hungarian-matched
+part NME/PCK, GT-part coverage, predicted-part precision, and part diversity.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200-Curv-Part/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200-Curv-Part/best.pth \
+  --out output/localization_cub_layer2 \
+  --layer 2 \
+  --map-sources curvature curv_weight part_attention \
+  --batch-size 8 \
+  --num-workers 4 \
+  --top-fraction 0.20 \
+  --bootstrap-samples 2000
+```
+
+Use `--max-images 100` for a quick smoke test. Add `hvp_curvature` to
+`--map-sources` only when teacher localization is needed; it computes HVPs and
+is much slower, so use batch size 1 or 2. Optional true foreground masks can be
+supplied with `--mask-dir`; the directory must mirror CUB image relative paths
+and use PNG files. Without masks, all foreground and IoU metrics are explicitly
+box-based.
+
+Outputs:
+
+- `localization_per_image.csv`: one row per test image;
+- `localization_summary.csv`: mean, standard deviation, and bootstrap 95% CI;
+- `localization_summary.json`: metric definitions and run configuration;
+- `overlay_*.jpg`: green box, cyan GT parts, and yellow predicted part peaks.
