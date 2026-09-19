@@ -252,6 +252,88 @@ def validate_evidence_attention(part_maps: np.ndarray, atol: float = 1e-3) -> Di
     }
 
 
+def _stable_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    shifted = x - np.max(x, axis=axis, keepdims=True)
+    exp_x = np.exp(shifted)
+    return exp_x / np.maximum(exp_x.sum(axis=axis, keepdims=True), EPS)
+
+
+def _centered_rms(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    centered = x - x.mean(axis=-1, keepdims=True)
+    return float(np.sqrt(np.mean(centered ** 2)))
+
+
+def _centered_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = (a - a.mean(axis=-1, keepdims=True)).reshape(-1)
+    b = (b - b.mean(axis=-1, keepdims=True)).reshape(-1)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom > EPS else float("nan")
+
+
+def decompose_part_attention_logits(
+    final_logits: np.ndarray,
+    token_part_similarity: np.ndarray,
+    curvature: np.ndarray,
+    similarity_gate: float,
+    curvature_gate: float,
+    observed_attention: Optional[np.ndarray] = None,
+):
+    """Reconstruct and diagnose the three additive Part-attention logit terms.
+
+    The model computes final = content + similarity_gate * token_part_sim.T
+    + curvature_gate * log1p(curvature).  Each component is converted to a
+    spatial Softmax only for interpretable, like-for-like diagnostics.
+    """
+    final = np.asarray(final_logits, dtype=np.float64).squeeze()
+    similarity = np.asarray(token_part_similarity, dtype=np.float64).squeeze()
+    curv = np.asarray(curvature, dtype=np.float64).reshape(-1)
+    if final.ndim != 2:
+        raise ValueError(f"final_logits must be [P,N], got {final.shape}")
+    parts, tokens = final.shape
+    if similarity.shape == (tokens, parts):
+        similarity = similarity.T
+    if similarity.shape != final.shape:
+        raise ValueError(
+            f"token_part_similarity must be [N,P] or [P,N], got {similarity.shape}"
+        )
+    if len(curv) != tokens:
+        raise ValueError(f"curvature length {len(curv)} does not match N={tokens}")
+
+    semantic = float(similarity_gate) * similarity
+    curvature_term = float(curvature_gate) * np.log1p(np.maximum(curv, 0.0))[None, :]
+    curvature_term = np.broadcast_to(curvature_term, final.shape).copy()
+    content = final - semantic - curvature_term
+    components = {
+        "content": content,
+        "semantic": semantic,
+        "curvature": curvature_term,
+        "final": final,
+    }
+    maps = {name: _stable_softmax(value, axis=-1) for name, value in components.items()}
+
+    final_rms = max(_centered_rms(final), EPS)
+    diagnostics = {}
+    final_peaks = np.argmax(final, axis=-1)
+    for name, value in components.items():
+        rms = _centered_rms(value)
+        diagnostics[f"{name}_centered_rms"] = rms
+        diagnostics[f"{name}_rms_over_final"] = float(rms / final_rms)
+        diagnostics[f"{name}_correlation_with_final"] = _centered_correlation(value, final)
+        diagnostics[f"{name}_peak_agreement_with_final"] = float(
+            np.mean(np.argmax(value, axis=-1) == final_peaks)
+        )
+    if observed_attention is not None:
+        observed = np.asarray(observed_attention, dtype=np.float64).reshape(final.shape)
+        diagnostics["softmax_reconstruction_max_abs_error"] = float(
+            np.max(np.abs(maps["final"] - observed))
+        )
+    return maps, diagnostics
+
+
 def evaluate_evidence_consensus(
     part_maps: np.ndarray,
     foreground_mask: np.ndarray,

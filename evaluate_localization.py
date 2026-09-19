@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader, Subset
 
 from localization_metrics import (
     aggregate_evidence_maps,
+    decompose_part_attention_logits,
     evaluate_heatmap,
     evaluate_evidence_consensus,
     evaluate_part_points,
@@ -139,6 +140,17 @@ def parse_args():
         choices=("nearest", "bilinear"),
         default="nearest",
         help="Rendering only. Nearest preserves the original token grid; metrics always use bilinear dense maps.",
+    )
+    parser.add_argument(
+        "--attention-decomposition",
+        action="store_true",
+        help="Decompose the same Part-attention logits into content, semantic, curvature, and final terms.",
+    )
+    parser.add_argument(
+        "--save-decomposition-maps",
+        type=int,
+        default=20,
+        help="Number of decomposition figures saved when --attention-decomposition is enabled.",
     )
     parser.add_argument(
         "--causal-deletion",
@@ -559,6 +571,42 @@ def save_attention_figure(
     canvas.save(path)
 
 
+def save_decomposition_figure(path, evaluation_image, component_maps, interpolation="nearest"):
+    """Save probability maps induced by each additive attention-logit term."""
+    order = ("content", "semantic", "curvature", "final")
+    maps = {name: np.asarray(component_maps[name], dtype=np.float64).mean(axis=0) for name in order}
+    panel_size = 256
+    title_height = 36
+    gap = 8
+    resampling = getattr(Image, "Resampling", Image)
+    render_resample = resampling.NEAREST if interpolation == "nearest" else resampling.BILINEAR
+    shared_vmax = max(float(np.nanmax(value)) for value in maps.values())
+    panels = [("Input", evaluation_image.convert("RGB"))]
+    for name in order:
+        value = maps[name]
+        colored = Image.fromarray(
+            _viridis_rgb(value, vmin=0.0, vmax=shared_vmax), mode="RGB"
+        ).resize((panel_size, panel_size), resample=render_resample)
+        panels.append((f"{name.title()}  max={float(value.max()):.3g}", colored))
+
+    canvas = Image.new(
+        "RGB",
+        (len(panels) * panel_size + (len(panels) - 1) * gap, panel_size + title_height),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    font = _load_figure_font(17)
+    for panel_index, (title, panel) in enumerate(panels):
+        x = panel_index * (panel_size + gap)
+        if title == "Input":
+            panel = panel.resize((panel_size, panel_size), resample=resampling.BILINEAR)
+        canvas.paste(panel, (x, title_height))
+        bbox = draw.textbbox((0, 0), title, font=font) if hasattr(draw, "textbbox") else None
+        text_width = bbox[2] - bbox[0] if bbox else draw.textsize(title, font=font)[0]
+        draw.text((x + max(0, (panel_size - text_width) // 2), 8), title, fill="black", font=font)
+    canvas.save(path)
+
+
 def summarize(rows, bootstrap_samples, seed):
     rng = np.random.default_rng(seed)
     metadata_keys = {"image_id", "target", "layer", "visible_parts"}
@@ -698,6 +746,22 @@ def main():
         if part_attention is None:
             raise KeyError(f"missing part_attn_{args.layer}; update MetaFG_meta.py to expose pre-dropout part attention")
 
+        decomposition_inputs = None
+        if args.attention_decomposition:
+            required = {
+                "attn_logits": aux.get(f"attn_logits_{args.layer}"),
+                "token_part_sim": aux.get(f"token_part_sim_{args.layer}"),
+                "curvature": aux.get(f"curvature_{args.layer}"),
+                "gate_status": aux.get(f"gate_status_{args.layer}"),
+            }
+            missing_decomposition = [key for key, value in required.items() if value is None]
+            if missing_decomposition:
+                raise KeyError(
+                    "attention decomposition requires missing aux values: "
+                    + ", ".join(missing_decomposition)
+                )
+            decomposition_inputs = required
+
         flipped_part_attention = None
         if args.flip_stability:
             with torch.no_grad():
@@ -774,6 +838,33 @@ def main():
                 for key, value in attention_check.items()
             })
             row.update({f"evidence_{key}": value for key, value in evidence.items()})
+
+            component_maps = None
+            if decomposition_inputs is not None:
+                gates = decomposition_inputs["gate_status"]
+                component_maps, component_diagnostics = decompose_part_attention_logits(
+                    decomposition_inputs["attn_logits"][local_index].detach().float().cpu().numpy(),
+                    decomposition_inputs["token_part_sim"][local_index].detach().float().cpu().numpy(),
+                    decomposition_inputs["curvature"][local_index].detach().float().cpu().numpy(),
+                    similarity_gate=float(gates["sim_logit_gate"]),
+                    curvature_gate=float(gates["curv_logit_gate"]),
+                    observed_attention=part_maps.reshape(len(part_maps), -1),
+                )
+                row.update({
+                    f"decomposition_{key}": value
+                    for key, value in component_diagnostics.items()
+                })
+                for component_name, component_part_maps in component_maps.items():
+                    component_grid = component_part_maps.reshape(part_maps.shape)
+                    component_mean = aggregate_evidence_maps(component_grid, "mean")
+                    dense_component = token_vector_to_dense(component_mean.reshape(-1), image_size)
+                    component_metrics = evaluate_heatmap(
+                        dense_component, foreground, args.top_fraction
+                    )
+                    row.update({
+                        f"decomposition_{component_name}_{key}": value
+                        for key, value in component_metrics.items()
+                    })
 
             if flipped_part_attention is not None:
                 flipped_maps = part_tensor_to_maps(flipped_part_attention, local_index)
@@ -867,6 +958,20 @@ def main():
                     token_selection=args.visualize_token_selection,
                     token_ids=args.visualize_token_ids,
                 )
+            if (
+                args.attention_decomposition
+                and component_maps is not None
+                and global_index < args.save_decomposition_maps
+            ):
+                save_decomposition_figure(
+                    output_dir / f"decomposition_{global_index:05d}.png",
+                    input_tensor_to_pil(images[local_index]),
+                    {
+                        name: value.reshape(part_maps.shape)
+                        for name, value in component_maps.items()
+                    },
+                    interpolation=args.attention_interpolation,
+                )
             global_index += 1
 
         if batch_index % 20 == 0:
@@ -886,6 +991,10 @@ def main():
                 "attention_visualization_definition": (
                     "input, selected aggregate, and a compact subset of evidence-token Softmax maps; "
                     "fixed token ids and a shared zero-based color scale are the default, while all tokens are evaluated"
+                ),
+                "attention_decomposition_definition": (
+                    "final Part-attention logits reconstructed as content + gated semantic similarity + "
+                    "gated log1p curvature; component maps are spatial Softmax diagnostics of the same logits"
                 ),
                 "evidence_consensus_definition": (
                     "modal spatial peak across unconstrained Softmax evidence tokens; "

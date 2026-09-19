@@ -162,6 +162,27 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
   --flip-stability
 ```
 
+To diagnose which additive term creates a boundary-biased Part-attention map:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/attention_decomposition_layer2 \
+  --layer 2 \
+  --map-sources part_attention \
+  --max-images 200 \
+  --sample-mode stratified \
+  --attention-decomposition \
+  --save-decomposition-maps 20
+```
+
+`decomposition_*.png` shows Input, Content, Semantic, Curvature, and Final maps
+from the same Part-attention logits. The CSV reports centered RMS contribution,
+correlation with the final logits, peak agreement, localization metrics for
+each component, and the Softmax reconstruction error. This is a diagnostic of
+the existing Softmax attention, not a different attribution method.
+
 `evidence_consensus_ratio` measures how many evidence tokens share the modal
 peak and is descriptive rather than an optimization target. A positive
 `causal_consensus_minus_random_foreground_target_probability_drop` means that

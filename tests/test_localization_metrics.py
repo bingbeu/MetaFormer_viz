@@ -3,6 +3,7 @@ import numpy as np
 from localization_metrics import (
     aggregate_evidence_maps,
     box_iou_from_masks,
+    decompose_part_attention_logits,
     evaluate_evidence_consensus,
     evaluate_heatmap,
     evaluate_part_points,
@@ -111,3 +112,21 @@ def test_stratified_quick_sample_does_not_take_one_class_prefix():
     assert len(indices) == 4
     assert len({labels[index] for index in indices}) == 4
     assert select_evaluation_indices(labels, 4, mode="sequential").tolist() == [0, 1, 2, 3]
+
+
+def test_attention_logit_decomposition_reconstructs_observed_softmax():
+    content = np.asarray([[0.0, 1.0, -0.5], [0.3, -0.2, 0.1]])
+    similarity_np = np.asarray([[0.2, 0.1], [-0.1, 0.3], [0.4, -0.2]])
+    curvature = np.asarray([0.1, 0.5, 0.2])
+    sim_gate, curv_gate = 0.4, 0.7
+    semantic = sim_gate * similarity_np.T
+    curvature_term = curv_gate * np.log1p(curvature)[None, :]
+    final = content + semantic + curvature_term
+    shifted = final - final.max(axis=-1, keepdims=True)
+    observed = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+    maps, metrics = decompose_part_attention_logits(
+        final, similarity_np, curvature, sim_gate, curv_gate, observed
+    )
+    assert np.allclose(maps["final"], observed)
+    assert metrics["softmax_reconstruction_max_abs_error"] < 1e-12
+    assert metrics["content_peak_agreement_with_final"] == 1.0
