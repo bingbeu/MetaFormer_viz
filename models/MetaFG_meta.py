@@ -73,6 +73,7 @@ class MetaFG_Meta(nn.Module):
                 category_emb_path: str = None,   # 类别名文本库 .npy [num_classes, 768]
                 temperature: float = 1.0,         # 类别路由 softmax 温度
                 lambda_route: float = 0.1,        # loss_route 权重
+                content_attention_mode: str = "raw",
                 use_checkpoint=False):
         super().__init__()
         self.only_last_cls = only_last_cls
@@ -141,7 +142,8 @@ class MetaFG_Meta(nn.Module):
             hvp_probe=hvp_probe,
             hvp_samples=hvp_samples,
             curv_tau=curv_tau,
-            curv_reg_weight=curv_reg_weight
+            curv_reg_weight=curv_reg_weight,
+            content_attention_mode=content_attention_mode,
         )
         self.part_gen_2 = SemanticPartTokenGeneratorV6(
             in_dim=attn_embed_dims[0],
@@ -152,7 +154,8 @@ class MetaFG_Meta(nn.Module):
             hvp_probe=hvp_probe,
             hvp_samples=hvp_samples,
             curv_tau=curv_tau,
-            curv_reg_weight=curv_reg_weight
+            curv_reg_weight=curv_reg_weight,
+            content_attention_mode=content_attention_mode,
         )
         stem_chs = (3 * (conv_embed_dims[0] // 4), conv_embed_dims[0])
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(conv_depths[1:]+attn_depths))]

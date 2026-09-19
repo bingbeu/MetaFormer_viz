@@ -221,6 +221,16 @@ The default is `--content-attention-mode raw`, which is exactly the historical
 checkpoint behavior. Compare classification and localization metrics between
 the two output directories before deciding whether to fine-tune the model.
 
+For normal training or `main.py --eval`, select the same forward path through
+the regular configuration system:
+
+```bash
+python main.py --cfg <config.yaml> --eval --resume <checkpoint.pth> \
+  --opts MODEL.CONTENT_ATTENTION_MODE cosine_mean_norm
+```
+
+`MODEL.CONTENT_ATTENTION_MODE` defaults to `raw` for backward compatibility.
+
 `evidence_consensus_ratio` measures how many evidence tokens share the modal
 peak and is descriptive rather than an optimization target. A positive
 `causal_consensus_minus_random_foreground_target_probability_drop` means that

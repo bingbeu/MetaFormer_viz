@@ -27,6 +27,9 @@ def build_model(config):
                 extra_token_num=config.MODEL.EXTRA_TOKEN_NUM,
                 meta_dims=config.MODEL.META_DIMS,
                 category_emb_path=_CATEGORY_BANK.get(config.DATA.DATASET),
+                content_attention_mode=getattr(
+                    config.MODEL, 'CONTENT_ATTENTION_MODE', 'raw'
+                ),
                 assess=config.MODEL.assess
         )
     else:
