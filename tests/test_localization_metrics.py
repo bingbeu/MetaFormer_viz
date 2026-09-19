@@ -8,6 +8,7 @@ from localization_metrics import (
     evaluate_part_points,
     pointing_game,
     select_top_evidence_tokens,
+    select_evaluation_indices,
     square_deletion_mask,
     top_fraction_mask,
     validate_evidence_attention,
@@ -102,3 +103,11 @@ def test_attention_probability_validation():
     invalid = maps.copy()
     invalid[0] *= 2.0
     assert validate_evidence_attention(invalid)["probability_valid"] == 0.0
+
+
+def test_stratified_quick_sample_does_not_take_one_class_prefix():
+    labels = [0] * 10 + [1] * 10 + [2] * 10 + [3] * 10
+    indices = select_evaluation_indices(labels, 4, mode="stratified", seed=0)
+    assert len(indices) == 4
+    assert len({labels[index] for index in indices}) == 4
+    assert select_evaluation_indices(labels, 4, mode="sequential").tolist() == [0, 1, 2, 3]

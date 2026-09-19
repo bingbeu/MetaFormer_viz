@@ -9,12 +9,61 @@ IoU.
 from __future__ import annotations
 
 from typing import Dict, Iterable, Optional, Sequence, Tuple
+from collections import defaultdict
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
 EPS = 1e-12
+
+
+def select_evaluation_indices(
+    labels: Sequence[int],
+    max_images: int,
+    mode: str = "stratified",
+    seed: int = 0,
+) -> np.ndarray:
+    """Select deterministic quick-evaluation indices.
+
+    CUB is class-sorted, so taking the first N images can accidentally evaluate
+    only one class. Stratified round-robin sampling is the safe default.
+    """
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    total = len(labels)
+    if max_images <= 0 or max_images >= total:
+        return np.arange(total, dtype=np.int64)
+    if mode == "sequential":
+        return np.arange(max_images, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    if mode == "random":
+        return rng.choice(total, size=max_images, replace=False).astype(np.int64)
+    if mode != "stratified":
+        raise ValueError("mode must be 'sequential', 'random', or 'stratified'")
+
+    groups = defaultdict(list)
+    for index, label in enumerate(labels.tolist()):
+        groups[int(label)].append(index)
+    class_ids = np.asarray(sorted(groups), dtype=np.int64)
+    rng.shuffle(class_ids)
+    for class_id in class_ids:
+        rng.shuffle(groups[int(class_id)])
+
+    selected = []
+    depth = 0
+    while len(selected) < max_images:
+        added = False
+        for class_id in class_ids:
+            items = groups[int(class_id)]
+            if depth < len(items):
+                selected.append(items[depth])
+                added = True
+                if len(selected) == max_images:
+                    break
+        if not added:
+            break
+        depth += 1
+    return np.asarray(selected, dtype=np.int64)
 
 
 def _finite_2d(x: np.ndarray) -> np.ndarray:

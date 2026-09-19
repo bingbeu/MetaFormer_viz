@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from localization_metrics import (
     aggregate_evidence_maps,
@@ -41,6 +41,7 @@ from localization_metrics import (
     foreground_energy_fraction,
     part_peak_points,
     select_top_evidence_tokens,
+    select_evaluation_indices,
     square_deletion_mask,
     validate_evidence_attention,
 )
@@ -84,6 +85,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-images", type=int, default=0, help="0 evaluates the full test set")
+    parser.add_argument(
+        "--sample-mode",
+        choices=("stratified", "random", "sequential"),
+        default="stratified",
+        help="Sampling used when --max-images is set. Stratified avoids CUB's class-sorted prefix bias.",
+    )
     parser.add_argument("--top-fraction", type=float, default=0.20)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
@@ -640,8 +647,17 @@ def main():
 
     # Do not reuse build_loader's SubsetRandomSampler: sequential order is
     # required to keep sample paths and annotations exactly aligned.
+    labels = [int(sample[1]) for sample in dataset_val.samples]
+    selected_indices = select_evaluation_indices(
+        labels, args.max_images, mode=args.sample_mode, seed=args.seed
+    )
+    evaluation_dataset = (
+        dataset_val
+        if len(selected_indices) == len(dataset_val)
+        else Subset(dataset_val, selected_indices.tolist())
+    )
     loader = DataLoader(
-        dataset_val,
+        evaluation_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -651,7 +667,7 @@ def main():
     annotations = CUBAnnotations(find_cub_root(dataset_val))
     image_size = int(cfg.DATA.IMG_SIZE)
     crop = bool(cfg.TEST.CROP)
-    samples_meta = dataset_val.samples
+    samples_meta = [dataset_val.samples[int(index)] for index in selected_indices]
     use_hvp = "hvp_curvature" in args.map_sources
 
     rows = []

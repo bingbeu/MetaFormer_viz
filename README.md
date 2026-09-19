@@ -134,6 +134,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
   --map-sources curvature curv_weight part_attention \
   --batch-size 8 \
   --num-workers 4 \
+  --sample-mode stratified \
   --top-fraction 0.20 \
   --save-attention-maps 20 \
   --visualize-top-k 4 \
@@ -168,7 +169,9 @@ masking the consensus patch hurts the target-class confidence more than masking
 matched random foreground patches. Lower `evidence_flip_stability_nme` means
 the consensus location is more stable after horizontal-flip inversion.
 
-Use `--max-images 100` for a quick smoke test. Add `hvp_curvature` to
+Use `--max-images 100` for a quick smoke test. With the default
+`--sample-mode stratified`, those images are drawn across classes instead of
+from CUB's class-sorted prefix. Add `hvp_curvature` to
 `--map-sources` only when teacher localization is needed; it computes HVPs and
 is much slower, so use batch size 1 or 2. Optional true foreground masks can be
 supplied with `--mask-dir`; the directory must mirror CUB image relative paths
