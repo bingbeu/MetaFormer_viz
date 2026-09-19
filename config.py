@@ -79,6 +79,7 @@ _C.MODEL.ONLY_LAST_CLS = False
 _C.MODEL.EXTRA_TOKEN_NUM = 1
 _C.MODEL.META_DIMS = []
 _C.MODEL.assess = False
+_C.MODEL.CONTENT_ATTENTION_MODE = 'raw'
 
 
 # -----------------------------------------------------------------------------

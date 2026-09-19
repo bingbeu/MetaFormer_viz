@@ -114,3 +114,151 @@ Results in iNaturalist 2019, iNaturalist 2018, and iNaturalist 2021 with meta-in
 
 ## Acknowledgement
 Many thanks for [swin-transformer](https://github.com/microsoft/Swin-Transformer).A part of the code is borrowed from it.
+
+#### Quantitative localization evaluation (CUB-200-2011)
+
+`evaluate_localization.py` evaluates the deployable curvature student and the
+actual pre-dropout attention used to form part tokens against the official CUB
+bounding boxes and visible part keypoints. It reports pointing-game accuracy,
+top-fraction pixel IoU, predicted-box IoU, IoU@0.5 localization accuracy,
+foreground energy/concentration, top-k foreground precision, Hungarian-matched
+part NME/PCK, GT-part coverage, and Softmax evidence-token consensus. Shared
+token peaks are treated as agreement, not automatically as part collapse.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200-Curv-Part/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200-Curv-Part/best.pth \
+  --out output/localization_cub_layer2 \
+  --layer 2 \
+  --map-sources curvature curv_weight part_attention \
+  --batch-size 8 \
+  --num-workers 4 \
+  --sample-mode stratified \
+  --top-fraction 0.20 \
+  --save-attention-maps 20 \
+  --visualize-top-k 4 \
+  --visualize-token-selection fixed \
+  --attention-aggregation mean \
+  --attention-interpolation nearest \
+  --bootstrap-samples 2000
+```
+
+To test whether a shared token peak is causally discriminative rather than a
+background/position shortcut, enable fixed-area deletion and flip stability:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200-Curv-Part/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200-Curv-Part/best.pth \
+  --out output/localization_causal_layer2 \
+  --layer 2 \
+  --map-sources curvature part_attention \
+  --batch-size 1 \
+  --causal-deletion \
+  --deletion-size 0.15 \
+  --deletion-random-samples 5 \
+  --deletion-batch-size 4 \
+  --flip-stability
+```
+
+To diagnose which additive term creates a boundary-biased Part-attention map:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/attention_decomposition_layer2 \
+  --layer 2 \
+  --map-sources part_attention \
+  --max-images 200 \
+  --sample-mode stratified \
+  --attention-decomposition \
+  --save-decomposition-maps 20
+```
+
+`decomposition_*.png` shows Input, Content, Semantic, Curvature, and Final maps
+from the same Part-attention logits. The CSV reports centered RMS contribution,
+correlation with the final logits, peak agreement, localization metrics for
+each component, and the Softmax reconstruction error. This is a diagnostic of
+the existing Softmax attention, not a different attribution method.
+
+If Content dominates, diagnose whether raw dot-product key norms create the
+boundary peak. This does not alter predictions:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/content_norm_diagnostic_layer2 \
+  --layer 2 --map-sources part_attention \
+  --max-images 200 --sample-mode stratified \
+  --content-norm-diagnostic --save-content-norm-maps 20
+```
+
+This diagnostic requires the updated `SemanticPartTokenGeneratorV6.py` and
+`MetaFG_meta.py`, which expose detached raw content logits, cosine content
+logits, and key norms only when `return_aux=True`.
+
+When the diagnostic confirms spatial key-norm bias, evaluate the real
+norm-decoupled forward path with `--content-attention-mode cosine_mean_norm`.
+It still uses the original spatial Softmax and does not impose token diversity.
+The mean query/key norms retain a conservative per-image, per-Part-token logit
+scale, while spatial ranking comes from cosine similarity:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/cosine_mean_norm_layer2 \
+  --layer 2 --map-sources part_attention \
+  --max-images 200 --sample-mode stratified \
+  --content-attention-mode cosine_mean_norm \
+  --save-attention-maps 20
+```
+
+The default is `--content-attention-mode raw`, which is exactly the historical
+checkpoint behavior. Compare classification and localization metrics between
+the two output directories before deciding whether to fine-tune the model.
+
+For normal training or `main.py --eval`, select the same forward path through
+the regular configuration system:
+
+```bash
+python main.py --cfg <config.yaml> --eval --resume <checkpoint.pth> \
+  --opts MODEL.CONTENT_ATTENTION_MODE cosine_mean_norm
+```
+
+`MODEL.CONTENT_ATTENTION_MODE` defaults to `raw` for backward compatibility.
+
+`evidence_consensus_ratio` measures how many evidence tokens share the modal
+peak and is descriptive rather than an optimization target. A positive
+`causal_consensus_minus_random_foreground_target_probability_drop` means that
+masking the consensus patch hurts the target-class confidence more than masking
+matched random foreground patches. Lower `evidence_flip_stability_nme` means
+the consensus location is more stable after horizontal-flip inversion.
+
+Use `--max-images 100` for a quick smoke test. With the default
+`--sample-mode stratified`, those images are drawn across classes instead of
+from CUB's class-sorted prefix. Add `hvp_curvature` to
+`--map-sources` only when teacher localization is needed; it computes HVPs and
+is much slower, so use batch size 1 or 2. Optional true foreground masks can be
+supplied with `--mask-dir`; the directory must mirror CUB image relative paths
+and use PNG files. Without masks, all foreground and IoU metrics are explicitly
+box-based.
+
+Outputs:
+
+- `localization_per_image.csv`: one row per test image;
+- `localization_summary.csv`: mean, standard deviation, and bootstrap 95% CI;
+- `localization_summary.json`: metric definitions and run configuration;
+- `attention_*.png`: input image, one aggregate Softmax evidence map, and the
+  selected evidence-token maps. `--visualize-top-k` may be smaller than
+  `--num-parts`; the default is the fixed indices 0,1,2,3, which avoids
+  per-image cherry-picking. Use `--visualize-token-ids 0 2 5` to choose an
+  explicit fixed subset. `top_peak` selection remains available only as a
+  labelled diagnostic. All displayed attention panels share one zero-based
+  color scale rather than independent min-max stretching. Quantitative results include
+  all tokens (`part_all_tokens_*`) plus both mean/max aggregate maps
+  (`part_attention_mean_*` and `part_attention_max_*`). These are evidence
+  tokens, not attention heads.
