@@ -10,6 +10,7 @@ from localization_metrics import (
     select_top_evidence_tokens,
     square_deletion_mask,
     top_fraction_mask,
+    validate_evidence_attention,
 )
 
 
@@ -90,3 +91,14 @@ def test_top_evidence_selection_is_peak_ranked_and_deterministic():
     maps[3, 1, 1] = 0.2
     assert select_top_evidence_tokens(maps, 3).tolist() == [1, 2, 0]
     assert select_top_evidence_tokens(maps, 99).tolist() == [1, 2, 0, 3]
+
+
+def test_attention_probability_validation():
+    maps = np.full((3, 2, 2), 0.25, dtype=float)
+    result = validate_evidence_attention(maps)
+    assert result["probability_valid"] == 1.0
+    assert np.isclose(result["probability_sum_mean"], 1.0)
+
+    invalid = maps.copy()
+    invalid[0] *= 2.0
+    assert validate_evidence_attention(invalid)["probability_valid"] == 0.0

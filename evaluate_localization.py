@@ -42,6 +42,7 @@ from localization_metrics import (
     part_peak_points,
     select_top_evidence_tokens,
     square_deletion_mask,
+    validate_evidence_attention,
 )
 from visualize import build_loader, build_model, load_config
 
@@ -105,6 +106,20 @@ def parse_args():
         type=int,
         default=4,
         help="Number of evidence-token maps shown per image; does not affect quantitative evaluation.",
+    )
+    parser.add_argument(
+        "--visualize-token-selection",
+        choices=("fixed", "top_peak"),
+        default="fixed",
+        help="Token panels to show. 'fixed' uses stable token indices and avoids per-image cherry-picking; "
+             "'top_peak' is retained only as an explicitly labelled diagnostic.",
+    )
+    parser.add_argument(
+        "--visualize-token-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Exact evidence-token indices to display, e.g. 0 2 5. Overrides --visualize-top-k/selection.",
     )
     parser.add_argument(
         "--attention-aggregation",
@@ -437,11 +452,13 @@ def input_tensor_to_pil(image_tensor):
     return Image.fromarray(array, mode="RGB")
 
 
-def _viridis_rgb(heatmap):
+def _viridis_rgb(heatmap, vmin=None, vmax=None):
     """Small dependency-free approximation of the perceptually uniform viridis map."""
     h = np.asarray(heatmap, dtype=np.float64)
     h = np.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
-    h = (h - h.min()) / max(float(h.max() - h.min()), 1e-12)
+    lo = float(h.min()) if vmin is None else float(vmin)
+    hi = float(h.max()) if vmax is None else float(vmax)
+    h = np.clip((h - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
     anchors = np.asarray([
         [68, 1, 84], [59, 82, 139], [33, 145, 140],
         [94, 201, 98], [253, 231, 37],
@@ -470,6 +487,8 @@ def save_attention_figure(
     top_k=4,
     aggregation="mean",
     interpolation="nearest",
+    token_selection="fixed",
+    token_ids=None,
 ):
     """Save input + aggregate + automatically selected evidence-token maps.
 
@@ -477,21 +496,38 @@ def save_attention_figure(
     Softmax attention remains untouched for every quantitative metric.
     """
     maps = np.asarray(part_maps, dtype=np.float64)
-    selected = select_top_evidence_tokens(maps, top_k)
+    if token_ids is not None:
+        selected = np.asarray(token_ids, dtype=np.int64)
+        if len(selected) and (selected.min() < 0 or selected.max() >= len(maps)):
+            raise ValueError(
+                f"visualized token ids must be in [0,{len(maps) - 1}], got {selected.tolist()}"
+            )
+    elif token_selection == "fixed":
+        selected = np.arange(min(int(top_k), len(maps)), dtype=np.int64)
+    elif token_selection == "top_peak":
+        selected = select_top_evidence_tokens(maps, top_k)
+    else:
+        raise ValueError("token_selection must be 'fixed' or 'top_peak'")
     aggregate = aggregate_evidence_maps(maps, aggregation)
     panels = [("Input", evaluation_image.convert("RGB"))]
     panel_size = 256
     resampling = getattr(Image, "Resampling", Image)
     render_resample = resampling.NEAREST if interpolation == "nearest" else resampling.BILINEAR
 
+    shown_maps = [aggregate] + [maps[token_id] for token_id in selected]
+    # All part-attention maps are spatial probability distributions, so one
+    # shared zero-based scale is meaningful and prevents per-panel contrast
+    # stretching from exaggerating tiny differences.
+    shared_vmax = max(float(np.nanmax(value)) for value in shown_maps)
+
     def render_map(value):
-        colored = Image.fromarray(_viridis_rgb(value), mode="RGB")
+        colored = Image.fromarray(_viridis_rgb(value, vmin=0.0, vmax=shared_vmax), mode="RGB")
         return colored.resize((panel_size, panel_size), resample=render_resample)
 
     panels.append((f"{aggregation.title()} Evidence", render_map(aggregate)))
     for token_id in selected:
         peak = float(np.nanmax(maps[token_id]))
-        panels.append((f"Evidence Token {int(token_id)}  peak={peak:.4g}", render_map(maps[token_id])))
+        panels.append((f"Token {int(token_id)}  max={peak:.3g}", render_map(maps[token_id])))
 
     title_height = 36
     gap = 8
@@ -566,6 +602,8 @@ def main():
         raise ValueError("--deletion-batch-size must be at least 1")
     if args.visualize_top_k < 0:
         raise ValueError("--visualize-top-k must be non-negative")
+    if args.visualize_token_ids is not None and len(set(args.visualize_token_ids)) != len(args.visualize_token_ids):
+        raise ValueError("--visualize-token-ids must not contain duplicates")
     set_deterministic(args.seed)
     init_single_process_group()
     output_dir = Path(args.out)
@@ -694,13 +732,31 @@ def main():
                 "layer": args.layer,
                 "foreground_kind": foreground_kind,
                 "visible_parts": int(len(gt_parts)),
+                "classification_top1": float(int(logits[local_index].argmax()) == int(targets[local_index])),
+                "classification_top5": float(
+                    int(targets[local_index]) in logits[local_index].topk(
+                        min(5, logits.shape[-1])
+                    ).indices.tolist()
+                ),
             }
-            selected_for_visualization = select_top_evidence_tokens(
-                part_maps, args.visualize_top_k
-            )
+            if args.visualize_token_ids is not None:
+                selected_for_visualization = np.asarray(args.visualize_token_ids, dtype=np.int64)
+            elif args.visualize_token_selection == "fixed":
+                selected_for_visualization = np.arange(
+                    min(args.visualize_top_k, len(part_maps)), dtype=np.int64
+                )
+            else:
+                selected_for_visualization = select_top_evidence_tokens(
+                    part_maps, args.visualize_top_k
+                )
             row["visualized_token_ids"] = ";".join(
                 str(int(token_id)) for token_id in selected_for_visualization
             )
+            attention_check = validate_evidence_attention(part_maps)
+            row.update({
+                f"part_attention_check_{key}": value
+                for key, value in attention_check.items()
+            })
             row.update({f"evidence_{key}": value for key, value in evidence.items()})
 
             if flipped_part_attention is not None:
@@ -792,6 +848,8 @@ def main():
                     top_k=args.visualize_top_k,
                     aggregation=args.attention_aggregation,
                     interpolation=args.attention_interpolation,
+                    token_selection=args.visualize_token_selection,
+                    token_ids=args.visualize_token_ids,
                 )
             global_index += 1
 
@@ -810,8 +868,8 @@ def main():
                 "iou_definition": f"exact top-{args.top_fraction:.0%} pixels; pred_box_iou is the tight box around them",
                 "part_attention_definition": "pre-dropout attention used to form part tokens",
                 "attention_visualization_definition": (
-                    "input, selected aggregate, and Top-K evidence-token Softmax maps; "
-                    "Top-K is ranked by peak response for visualization only, while all tokens are evaluated"
+                    "input, selected aggregate, and a compact subset of evidence-token Softmax maps; "
+                    "fixed token ids and a shared zero-based color scale are the default, while all tokens are evaluated"
                 ),
                 "evidence_consensus_definition": (
                     "modal spatial peak across unconstrained Softmax evidence tokens; "
@@ -834,6 +892,9 @@ def main():
     print(f"  details: {output_dir / 'localization_per_image.csv'}")
     print(f"  summary: {output_dir / 'localization_summary.csv'}")
     print(f"  json:    {output_dir / 'localization_summary.json'}")
+    if rows:
+        print(f"  top1:    {100.0 * np.mean([row['classification_top1'] for row in rows]):.3f}%")
+        print(f"  top5:    {100.0 * np.mean([row['classification_top5'] for row in rows]):.3f}%")
 
 
 if __name__ == "__main__":

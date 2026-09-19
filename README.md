@@ -137,6 +137,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
   --top-fraction 0.20 \
   --save-attention-maps 20 \
   --visualize-top-k 4 \
+  --visualize-token-selection fixed \
   --attention-aggregation mean \
   --attention-interpolation nearest \
   --bootstrap-samples 2000
@@ -180,9 +181,12 @@ Outputs:
 - `localization_summary.csv`: mean, standard deviation, and bootstrap 95% CI;
 - `localization_summary.json`: metric definitions and run configuration;
 - `attention_*.png`: input image, one aggregate Softmax evidence map, and the
-  automatically selected Top-K evidence-token maps. `--visualize-top-k` may be
-  smaller than `--num-parts`; the default is 4. Selection is deterministic by
-  peak response and affects visualization only. Quantitative results include
+  selected evidence-token maps. `--visualize-top-k` may be smaller than
+  `--num-parts`; the default is the fixed indices 0,1,2,3, which avoids
+  per-image cherry-picking. Use `--visualize-token-ids 0 2 5` to choose an
+  explicit fixed subset. `top_peak` selection remains available only as a
+  labelled diagnostic. All displayed attention panels share one zero-based
+  color scale rather than independent min-max stretching. Quantitative results include
   all tokens (`part_all_tokens_*`) plus both mean/max aggregate maps
   (`part_attention_mean_*` and `part_attention_max_*`). These are evidence
   tokens, not attention heads.

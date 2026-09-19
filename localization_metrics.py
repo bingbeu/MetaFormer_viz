@@ -183,6 +183,26 @@ def select_top_evidence_tokens(part_maps: np.ndarray, top_k: int) -> np.ndarray:
     return order[:count]
 
 
+def validate_evidence_attention(part_maps: np.ndarray, atol: float = 1e-3) -> Dict[str, float]:
+    """Validate that maps behave like probabilities over spatial tokens."""
+    maps = np.asarray(part_maps, dtype=np.float64)
+    if maps.ndim != 3 or len(maps) == 0:
+        raise ValueError(f"part_maps must be non-empty [P,H,W], got {maps.shape}")
+    if not np.isfinite(maps).all():
+        raise ValueError("part attention contains NaN or infinite values")
+    sums = maps.reshape(len(maps), -1).sum(axis=1)
+    max_sum_error = float(np.max(np.abs(sums - 1.0)))
+    minimum = float(maps.min())
+    valid = minimum >= -atol and max_sum_error <= atol
+    return {
+        "probability_valid": float(valid),
+        "probability_sum_mean": float(sums.mean()),
+        "probability_sum_max_abs_error": max_sum_error,
+        "minimum": minimum,
+        "maximum": float(maps.max()),
+    }
+
+
 def evaluate_evidence_consensus(
     part_maps: np.ndarray,
     foreground_mask: np.ndarray,
