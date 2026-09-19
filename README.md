@@ -200,6 +200,27 @@ This diagnostic requires the updated `SemanticPartTokenGeneratorV6.py` and
 `MetaFG_meta.py`, which expose detached raw content logits, cosine content
 logits, and key norms only when `return_aux=True`.
 
+When the diagnostic confirms spatial key-norm bias, evaluate the real
+norm-decoupled forward path with `--content-attention-mode cosine_mean_norm`.
+It still uses the original spatial Softmax and does not impose token diversity.
+The mean query/key norms retain a conservative per-image, per-Part-token logit
+scale, while spatial ranking comes from cosine similarity:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/cosine_mean_norm_layer2 \
+  --layer 2 --map-sources part_attention \
+  --max-images 200 --sample-mode stratified \
+  --content-attention-mode cosine_mean_norm \
+  --save-attention-maps 20
+```
+
+The default is `--content-attention-mode raw`, which is exactly the historical
+checkpoint behavior. Compare classification and localization metrics between
+the two output directories before deciding whether to fine-tune the model.
+
 `evidence_consensus_ratio` measures how many evidence tokens share the modal
 peak and is descriptive rather than an optimization target. A positive
 `causal_consensus_minus_random_foreground_target_probability_drop` means that

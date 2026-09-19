@@ -159,6 +159,15 @@ def parse_args():
         help="Compare raw q-k dot-product attention with equal-sharpness cosine attention and key norms.",
     )
     parser.add_argument(
+        "--content-attention-mode",
+        choices=("raw", "cosine_mean_norm"),
+        default="raw",
+        help=(
+            "Actual content term used to form Part tokens. raw preserves the checkpoint behavior; "
+            "cosine_mean_norm removes spatial key-norm bias while retaining mean-norm sharpness."
+        ),
+    )
+    parser.add_argument(
         "--save-content-norm-maps",
         type=int,
         default=20,
@@ -208,6 +217,22 @@ def load_checkpoint(path):
         return torch.load(path, map_location="cpu", weights_only=False, pickle_module=_pm)
     except TypeError:  # PyTorch 1.x has no weights_only argument
         return torch.load(path, map_location="cpu", pickle_module=_pm)
+
+
+def set_content_attention_mode(model, mode):
+    """Configure every Part generator without adding checkpoint parameters."""
+    configured = 0
+    for module in model.modules():
+        setter = getattr(module, "set_content_attention_mode", None)
+        if callable(setter):
+            setter(mode)
+            configured += 1
+    if configured == 0:
+        raise RuntimeError(
+            "no Part generator supports --content-attention-mode; "
+            "install the updated SemanticPartTokenGeneratorV6.py"
+        )
+    return configured
 
 
 def find_aux(output):
@@ -730,6 +755,11 @@ def main():
     model = build_model(cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"[checkpoint] missing={len(missing)}, unexpected={len(unexpected)}")
+    configured_generators = set_content_attention_mode(model, args.content_attention_mode)
+    print(
+        f"[attention] mode={args.content_attention_mode}, "
+        f"part_generators={configured_generators}"
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
     model.assess = True
@@ -812,7 +842,10 @@ def main():
         content_norm_inputs = None
         if args.content_norm_diagnostic:
             required = {
-                "content_logits": aux.get(f"content_logits_{args.layer}"),
+                "content_logits": aux.get(
+                    f"raw_content_logits_{args.layer}",
+                    aux.get(f"content_logits_{args.layer}"),
+                ),
                 "content_cosine_logits": aux.get(f"content_cosine_logits_{args.layer}"),
                 "key_norm": aux.get(f"key_norm_{args.layer}"),
             }
