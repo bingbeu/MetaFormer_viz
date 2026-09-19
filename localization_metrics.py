@@ -151,6 +151,38 @@ def part_peak_points(part_maps: np.ndarray, image_shape: Sequence[int]) -> np.nd
     return np.asarray(points, dtype=np.float64)
 
 
+def aggregate_evidence_maps(part_maps: np.ndarray, method: str = "mean") -> np.ndarray:
+    """Aggregate all evidence-token maps without selecting individual tokens."""
+    maps = np.asarray(part_maps, dtype=np.float64)
+    if maps.ndim != 3 or len(maps) == 0:
+        raise ValueError(f"part_maps must be non-empty [P,H,W], got {maps.shape}")
+    maps = np.nan_to_num(maps, nan=0.0, posinf=0.0, neginf=0.0)
+    if method == "mean":
+        return maps.mean(axis=0)
+    if method == "max":
+        return maps.max(axis=0)
+    raise ValueError("method must be 'mean' or 'max'")
+
+
+def select_top_evidence_tokens(part_maps: np.ndarray, top_k: int) -> np.ndarray:
+    """Return deterministic token indices ranked by peak Softmax response.
+
+    This ranking is for compact visualization only.  Ties are resolved by the
+    original token index, and quantitative evaluation must still use all
+    evidence tokens.
+    """
+    maps = np.asarray(part_maps, dtype=np.float64)
+    if maps.ndim != 3 or len(maps) == 0:
+        raise ValueError(f"part_maps must be non-empty [P,H,W], got {maps.shape}")
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+    count = min(int(top_k), len(maps))
+    peaks = np.nan_to_num(maps, nan=-np.inf).reshape(len(maps), -1).max(axis=1)
+    # lexsort uses the final key as primary: descending peak, then token id.
+    order = np.lexsort((np.arange(len(maps)), -peaks))
+    return order[:count]
+
+
 def evaluate_evidence_consensus(
     part_maps: np.ndarray,
     foreground_mask: np.ndarray,

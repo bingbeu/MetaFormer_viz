@@ -30,15 +30,17 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 
 from localization_metrics import (
+    aggregate_evidence_maps,
     evaluate_heatmap,
     evaluate_evidence_consensus,
     evaluate_part_points,
     foreground_energy_fraction,
     part_peak_points,
+    select_top_evidence_tokens,
     square_deletion_mask,
 )
 from visualize import build_loader, build_model, load_config
@@ -91,6 +93,31 @@ def parse_args():
              "Without this option, foreground metrics use official CUB boxes.",
     )
     parser.add_argument("--save-overlays", type=int, default=20)
+    parser.add_argument(
+        "--save-attention-maps",
+        type=int,
+        default=None,
+        help="Number of continuous evidence-attention figures to save. "
+             "Defaults to --save-overlays for backward compatibility.",
+    )
+    parser.add_argument(
+        "--visualize-top-k",
+        type=int,
+        default=4,
+        help="Number of evidence-token maps shown per image; does not affect quantitative evaluation.",
+    )
+    parser.add_argument(
+        "--attention-aggregation",
+        choices=("mean", "max"),
+        default="mean",
+        help="Aggregation displayed beside the input image. Both mean and max are evaluated quantitatively.",
+    )
+    parser.add_argument(
+        "--attention-interpolation",
+        choices=("nearest", "bilinear"),
+        default="nearest",
+        help="Rendering only. Nearest preserves the original token grid; metrics always use bilinear dense maps.",
+    )
     parser.add_argument(
         "--causal-deletion",
         action="store_true",
@@ -410,28 +437,83 @@ def input_tensor_to_pil(image_tensor):
     return Image.fromarray(array, mode="RGB")
 
 
-def save_overlay(path, evaluation_image, heatmap, box_mask, gt_parts, pred_parts, consensus_point=None):
-    image = evaluation_image.convert("RGB")
-    h = heatmap.astype(np.float64)
+def _viridis_rgb(heatmap):
+    """Small dependency-free approximation of the perceptually uniform viridis map."""
+    h = np.asarray(heatmap, dtype=np.float64)
+    h = np.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
     h = (h - h.min()) / max(float(h.max() - h.min()), 1e-12)
-    colors = np.zeros((h.shape[0], h.shape[1], 4), dtype=np.uint8)
-    colors[..., 0] = 255
-    colors[..., 1] = (80 * (1.0 - h)).astype(np.uint8)
-    colors[..., 3] = (150 * h).astype(np.uint8)
-    image = Image.alpha_composite(image.convert("RGBA"), Image.fromarray(colors, mode="RGBA"))
-    draw = ImageDraw.Draw(image)
-    ys, xs = np.nonzero(box_mask)
-    if len(xs):
-        draw.rectangle((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())), outline="lime", width=3)
-    for x, y in gt_parts:
-        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill="cyan")
-    for x, y in pred_parts:
-        draw.line((x - 4, y, x + 4, y), fill="yellow", width=2)
-        draw.line((x, y - 4, x, y + 4), fill="yellow", width=2)
-    if consensus_point is not None:
-        x, y = consensus_point
-        draw.ellipse((x - 7, y - 7, x + 7, y + 7), outline="magenta", width=3)
-    image.convert("RGB").save(path, quality=95)
+    anchors = np.asarray([
+        [68, 1, 84], [59, 82, 139], [33, 145, 140],
+        [94, 201, 98], [253, 231, 37],
+    ], dtype=np.float64)
+    position = h * (len(anchors) - 1)
+    lower = np.floor(position).astype(np.int64)
+    upper = np.minimum(lower + 1, len(anchors) - 1)
+    weight = (position - lower)[..., None]
+    return np.round(anchors[lower] * (1.0 - weight) + anchors[upper] * weight).astype(np.uint8)
+
+
+def _load_figure_font(size=18):
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ):
+        if Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size=size)
+    return ImageFont.load_default()
+
+
+def save_attention_figure(
+    path,
+    evaluation_image,
+    part_maps,
+    top_k=4,
+    aggregation="mean",
+    interpolation="nearest",
+):
+    """Save input + aggregate + automatically selected evidence-token maps.
+
+    Individual panels are normalized only for rendering. Raw pre-dropout
+    Softmax attention remains untouched for every quantitative metric.
+    """
+    maps = np.asarray(part_maps, dtype=np.float64)
+    selected = select_top_evidence_tokens(maps, top_k)
+    aggregate = aggregate_evidence_maps(maps, aggregation)
+    panels = [("Input", evaluation_image.convert("RGB"))]
+    panel_size = 256
+    resampling = getattr(Image, "Resampling", Image)
+    render_resample = resampling.NEAREST if interpolation == "nearest" else resampling.BILINEAR
+
+    def render_map(value):
+        colored = Image.fromarray(_viridis_rgb(value), mode="RGB")
+        return colored.resize((panel_size, panel_size), resample=render_resample)
+
+    panels.append((f"{aggregation.title()} Evidence", render_map(aggregate)))
+    for token_id in selected:
+        peak = float(np.nanmax(maps[token_id]))
+        panels.append((f"Evidence Token {int(token_id)}  peak={peak:.4g}", render_map(maps[token_id])))
+
+    title_height = 36
+    gap = 8
+    canvas = Image.new(
+        "RGB",
+        (len(panels) * panel_size + (len(panels) - 1) * gap, panel_size + title_height),
+        "white",
+    )
+    font = _load_figure_font(17)
+    draw = ImageDraw.Draw(canvas)
+    for panel_index, (title, panel) in enumerate(panels):
+        x = panel_index * (panel_size + gap)
+        if title == "Input":
+            panel = panel.resize((panel_size, panel_size), resample=resampling.BILINEAR)
+        canvas.paste(panel, (x, title_height))
+        if hasattr(draw, "textbbox"):
+            bbox = draw.textbbox((0, 0), title, font=font)
+            text_width = bbox[2] - bbox[0]
+        else:
+            text_width = draw.textsize(title, font=font)[0]
+        draw.text((x + max(0, (panel_size - text_width) // 2), 8), title, fill="black", font=font)
+    canvas.save(path)
 
 
 def summarize(rows, bootstrap_samples, seed):
@@ -482,6 +564,8 @@ def main():
         raise ValueError("--deletion-random-samples must be at least 1")
     if args.deletion_batch_size < 1:
         raise ValueError("--deletion-batch-size must be at least 1")
+    if args.visualize_top_k < 0:
+        raise ValueError("--visualize-top-k must be non-negative")
     set_deterministic(args.seed)
     init_single_process_group()
     output_dir = Path(args.out)
@@ -611,6 +695,12 @@ def main():
                 "foreground_kind": foreground_kind,
                 "visible_parts": int(len(gt_parts)),
             }
+            selected_for_visualization = select_top_evidence_tokens(
+                part_maps, args.visualize_top_k
+            )
+            row["visualized_token_ids"] = ";".join(
+                str(int(token_id)) for token_id in selected_for_visualization
+            )
             row.update({f"evidence_{key}": value for key, value in evidence.items()})
 
             if flipped_part_attention is not None:
@@ -631,7 +721,7 @@ def main():
             source_maps = {}
             for source in args.map_sources:
                 if source == "part_attention":
-                    token_map = part_maps.mean(axis=0)
+                    token_map = aggregate_evidence_maps(part_maps, args.attention_aggregation)
                     dense = token_vector_to_dense(token_map.reshape(-1), image_size)
                 else:
                     tensor = aux.get(f"{source}_{args.layer}")
@@ -649,11 +739,29 @@ def main():
             row.update({f"part_{key}": value for key, value in part_metrics.items()})
 
             per_part_energy = []
+            per_part_metrics = defaultdict(list)
             for part_map in part_maps:
                 dense_part = token_vector_to_dense(part_map.reshape(-1), image_size)
                 per_part_energy.append(foreground_energy_fraction(dense_part, foreground))
+                for metric_name, metric_value in evaluate_heatmap(
+                    dense_part, foreground, args.top_fraction
+                ).items():
+                    per_part_metrics[metric_name].append(metric_value)
             row["part_foreground_energy_mean"] = float(np.nanmean(per_part_energy))
             row["part_foreground_energy_min"] = float(np.nanmin(per_part_energy))
+            for metric_name, values in per_part_metrics.items():
+                row[f"part_all_tokens_{metric_name}_mean"] = float(np.nanmean(values))
+
+            # Report both aggregate definitions regardless of which one is
+            # selected for the visualization and backward-compatible key.
+            for aggregation in ("mean", "max"):
+                aggregate_map = aggregate_evidence_maps(part_maps, aggregation)
+                dense_aggregate = token_vector_to_dense(aggregate_map.reshape(-1), image_size)
+                aggregate_metrics = evaluate_heatmap(dense_aggregate, foreground, args.top_fraction)
+                row.update({
+                    f"part_attention_{aggregation}_{key}": value
+                    for key, value in aggregate_metrics.items()
+                })
 
             if args.causal_deletion:
                 meta_sample = None if meta is None else meta[local_index:local_index + 1]
@@ -673,16 +781,17 @@ def main():
                 ))
             rows.append(row)
 
-            if global_index < args.save_overlays:
-                overlay_source = "curvature" if "curvature" in source_maps else next(iter(source_maps))
-                save_overlay(
-                    output_dir / f"overlay_{global_index:05d}.jpg",
+            attention_figure_count = (
+                args.save_overlays if args.save_attention_maps is None else args.save_attention_maps
+            )
+            if global_index < attention_figure_count:
+                save_attention_figure(
+                    output_dir / f"attention_{global_index:05d}.png",
                     input_tensor_to_pil(images[local_index]),
-                    source_maps[overlay_source],
-                    box_mask,
-                    gt_parts,
-                    pred_parts,
-                    consensus_point=consensus_point,
+                    part_maps,
+                    top_k=args.visualize_top_k,
+                    aggregation=args.attention_aggregation,
+                    interpolation=args.attention_interpolation,
                 )
             global_index += 1
 
@@ -700,6 +809,10 @@ def main():
                 "foreground_default": "custom segmentation mask when available, otherwise CUB bounding box",
                 "iou_definition": f"exact top-{args.top_fraction:.0%} pixels; pred_box_iou is the tight box around them",
                 "part_attention_definition": "pre-dropout attention used to form part tokens",
+                "attention_visualization_definition": (
+                    "input, selected aggregate, and Top-K evidence-token Softmax maps; "
+                    "Top-K is ranked by peak response for visualization only, while all tokens are evaluated"
+                ),
                 "evidence_consensus_definition": (
                     "modal spatial peak across unconstrained Softmax evidence tokens; "
                     "agreement is descriptive and is not treated as a diversity objective"

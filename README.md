@@ -135,6 +135,10 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
   --batch-size 8 \
   --num-workers 4 \
   --top-fraction 0.20 \
+  --save-attention-maps 20 \
+  --visualize-top-k 4 \
+  --attention-aggregation mean \
+  --attention-interpolation nearest \
   --bootstrap-samples 2000
 ```
 
@@ -175,5 +179,10 @@ Outputs:
 - `localization_per_image.csv`: one row per test image;
 - `localization_summary.csv`: mean, standard deviation, and bootstrap 95% CI;
 - `localization_summary.json`: metric definitions and run configuration;
-- `overlay_*.jpg`: green box, cyan GT parts, yellow token peaks, and a magenta
-  circle around the consensus evidence peak.
+- `attention_*.png`: input image, one aggregate Softmax evidence map, and the
+  automatically selected Top-K evidence-token maps. `--visualize-top-k` may be
+  smaller than `--num-parts`; the default is 4. Selection is deterministic by
+  peak response and affects visualization only. Quantitative results include
+  all tokens (`part_all_tokens_*`) plus both mean/max aggregate maps
+  (`part_attention_mean_*` and `part_attention_max_*`). These are evidence
+  tokens, not attention heads.

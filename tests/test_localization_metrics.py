@@ -1,11 +1,13 @@
 import numpy as np
 
 from localization_metrics import (
+    aggregate_evidence_maps,
     box_iou_from_masks,
     evaluate_evidence_consensus,
     evaluate_heatmap,
     evaluate_part_points,
     pointing_game,
+    select_top_evidence_tokens,
     square_deletion_mask,
     top_fraction_mask,
 )
@@ -69,3 +71,22 @@ def test_square_deletion_mask_keeps_constant_area_at_border():
     assert mask.shape == (10, 10)
     assert int(mask.sum()) == 16
     assert mask[0, 0]
+
+
+def test_evidence_aggregation_uses_all_tokens():
+    maps = np.asarray([
+        [[0.0, 1.0], [0.0, 0.0]],
+        [[0.0, 0.0], [2.0, 0.0]],
+    ])
+    assert np.allclose(aggregate_evidence_maps(maps, "mean"), maps.mean(axis=0))
+    assert np.allclose(aggregate_evidence_maps(maps, "max"), maps.max(axis=0))
+
+
+def test_top_evidence_selection_is_peak_ranked_and_deterministic():
+    maps = np.zeros((4, 2, 2), dtype=float)
+    maps[0, 0, 0] = 0.5
+    maps[1, 0, 1] = 0.8
+    maps[2, 1, 0] = 0.8
+    maps[3, 1, 1] = 0.2
+    assert select_top_evidence_tokens(maps, 3).tolist() == [1, 2, 0]
+    assert select_top_evidence_tokens(maps, 99).tolist() == [1, 2, 0, 3]
