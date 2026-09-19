@@ -334,6 +334,60 @@ def decompose_part_attention_logits(
     return maps, diagnostics
 
 
+def diagnose_content_attention(
+    raw_content_logits: np.ndarray,
+    cosine_content_logits: np.ndarray,
+    key_norm: np.ndarray,
+):
+    """Separate dot-product direction from spatial key-norm effects.
+
+    Cosine logits are rescaled per Part token to the centered RMS of the raw
+    dot-product logits. Thus raw and cosine maps have comparable sharpness;
+    their remaining difference is attributable to q/k norm information.
+    """
+    raw = np.asarray(raw_content_logits, dtype=np.float64).squeeze()
+    cosine = np.asarray(cosine_content_logits, dtype=np.float64).squeeze()
+    norms = np.asarray(key_norm, dtype=np.float64).reshape(-1)
+    if raw.ndim != 2 or cosine.shape != raw.shape:
+        raise ValueError(f"raw/cosine logits must share [P,N], got {raw.shape}/{cosine.shape}")
+    if len(norms) != raw.shape[1]:
+        raise ValueError(f"key_norm length {len(norms)} does not match N={raw.shape[1]}")
+
+    raw_centered = raw - raw.mean(axis=-1, keepdims=True)
+    cosine_centered = cosine - cosine.mean(axis=-1, keepdims=True)
+    raw_rms = np.sqrt(np.mean(raw_centered ** 2, axis=-1, keepdims=True))
+    cosine_rms = np.sqrt(np.mean(cosine_centered ** 2, axis=-1, keepdims=True))
+    scale = raw_rms / np.maximum(cosine_rms, EPS)
+    cosine_matched = cosine_centered * scale
+
+    raw_maps = _stable_softmax(raw, axis=-1)
+    cosine_maps = _stable_softmax(cosine_matched, axis=-1)
+    nonnegative_norms = np.maximum(norms, 0.0)
+    key_norm_map = nonnegative_norms / max(float(nonnegative_norms.sum()), EPS)
+
+    raw_mean = raw_centered.mean(axis=0)
+    cosine_mean = cosine_matched.mean(axis=0)
+    diagnostics = {
+        "cosine_scale_mean": float(scale.mean()),
+        "raw_cosine_correlation": _centered_correlation(raw, cosine_matched),
+        "raw_cosine_peak_agreement": float(
+            np.mean(np.argmax(raw, axis=-1) == np.argmax(cosine_matched, axis=-1))
+        ),
+        "key_norm_correlation_with_raw": _centered_correlation(
+            norms.reshape(1, -1), raw_mean.reshape(1, -1)
+        ),
+        "key_norm_correlation_with_cosine": _centered_correlation(
+            norms.reshape(1, -1), cosine_mean.reshape(1, -1)
+        ),
+        "key_norm_peak_agreement_with_raw": float(np.argmax(norms) == np.argmax(raw_mean)),
+    }
+    return {
+        "raw_content": raw_maps,
+        "cosine_content": cosine_maps,
+        "key_norm": key_norm_map[None, :],
+    }, diagnostics
+
+
 def evaluate_evidence_consensus(
     part_maps: np.ndarray,
     foreground_mask: np.ndarray,

@@ -407,6 +407,14 @@ class MetaFG_Meta(nn.Module):
                 # attn_raw = softmax(attn_logits) BEFORE attention dropout.
                 # This is the correct quantity for Part heatmaps/diversity.
                 # ============================================================
+                "content_logits_1": aux_1.get("content_logits", None),
+                "content_logits_2": aux_2.get("content_logits", None),
+                "content_cosine_logits_1": aux_1.get("content_cosine_logits", None),
+                "content_cosine_logits_2": aux_2.get("content_cosine_logits", None),
+                "key_norm_1": aux_1.get("key_norm", None),
+                "key_norm_2": aux_2.get("key_norm", None),
+                "query_norm_1": aux_1.get("query_norm", None),
+                "query_norm_2": aux_2.get("query_norm", None),
                 "attn_logits_1": aux_1.get("attn_logits", None),
                 "attn_logits_2": aux_2.get("attn_logits", None),
                 "attn_raw_1": aux_1.get("attn_raw", None),

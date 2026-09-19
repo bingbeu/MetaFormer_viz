@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, Subset
 from localization_metrics import (
     aggregate_evidence_maps,
     decompose_part_attention_logits,
+    diagnose_content_attention,
     evaluate_heatmap,
     evaluate_evidence_consensus,
     evaluate_part_points,
@@ -151,6 +152,17 @@ def parse_args():
         type=int,
         default=20,
         help="Number of decomposition figures saved when --attention-decomposition is enabled.",
+    )
+    parser.add_argument(
+        "--content-norm-diagnostic",
+        action="store_true",
+        help="Compare raw q-k dot-product attention with equal-sharpness cosine attention and key norms.",
+    )
+    parser.add_argument(
+        "--save-content-norm-maps",
+        type=int,
+        default=20,
+        help="Number of raw/cosine/key-norm diagnostic figures to save.",
     )
     parser.add_argument(
         "--causal-deletion",
@@ -607,6 +619,41 @@ def save_decomposition_figure(path, evaluation_image, component_maps, interpolat
     canvas.save(path)
 
 
+def save_content_norm_figure(path, evaluation_image, diagnostic_maps, final_maps, interpolation="nearest"):
+    """Save raw content, matched cosine content, key norm, and final attention."""
+    named_maps = {
+        "Raw Content": np.asarray(diagnostic_maps["raw_content"]).mean(axis=0),
+        "Cosine Content": np.asarray(diagnostic_maps["cosine_content"]).mean(axis=0),
+        "Key Norm": np.asarray(diagnostic_maps["key_norm"]).mean(axis=0),
+        "Final": np.asarray(final_maps).mean(axis=0),
+    }
+    panel_size, title_height, gap = 256, 36, 8
+    resampling = getattr(Image, "Resampling", Image)
+    render_resample = resampling.NEAREST if interpolation == "nearest" else resampling.BILINEAR
+    shared_vmax = max(float(np.nanmax(value)) for value in named_maps.values())
+    panels = [("Input", evaluation_image.convert("RGB"))]
+    for name, value in named_maps.items():
+        panel = Image.fromarray(
+            _viridis_rgb(value, vmin=0.0, vmax=shared_vmax), mode="RGB"
+        ).resize((panel_size, panel_size), resample=render_resample)
+        panels.append((f"{name}  max={float(value.max()):.3g}", panel))
+    canvas = Image.new(
+        "RGB",
+        (len(panels) * panel_size + (len(panels) - 1) * gap, panel_size + title_height),
+        "white",
+    )
+    draw, font = ImageDraw.Draw(canvas), _load_figure_font(17)
+    for index, (title, panel) in enumerate(panels):
+        x = index * (panel_size + gap)
+        if title == "Input":
+            panel = panel.resize((panel_size, panel_size), resample=resampling.BILINEAR)
+        canvas.paste(panel, (x, title_height))
+        bbox = draw.textbbox((0, 0), title, font=font) if hasattr(draw, "textbbox") else None
+        width = bbox[2] - bbox[0] if bbox else draw.textsize(title, font=font)[0]
+        draw.text((x + max(0, (panel_size - width) // 2), 8), title, fill="black", font=font)
+    canvas.save(path)
+
+
 def summarize(rows, bootstrap_samples, seed):
     rng = np.random.default_rng(seed)
     metadata_keys = {"image_id", "target", "layer", "visible_parts"}
@@ -762,6 +809,21 @@ def main():
                 )
             decomposition_inputs = required
 
+        content_norm_inputs = None
+        if args.content_norm_diagnostic:
+            required = {
+                "content_logits": aux.get(f"content_logits_{args.layer}"),
+                "content_cosine_logits": aux.get(f"content_cosine_logits_{args.layer}"),
+                "key_norm": aux.get(f"key_norm_{args.layer}"),
+            }
+            missing_content_norm = [key for key, value in required.items() if value is None]
+            if missing_content_norm:
+                raise KeyError(
+                    "content norm diagnostic requires the updated model aux values: "
+                    + ", ".join(missing_content_norm)
+                )
+            content_norm_inputs = required
+
         flipped_part_attention = None
         if args.flip_stability:
             with torch.no_grad():
@@ -864,6 +926,29 @@ def main():
                     row.update({
                         f"decomposition_{component_name}_{key}": value
                         for key, value in component_metrics.items()
+                    })
+
+            content_norm_maps = None
+            if content_norm_inputs is not None:
+                content_norm_maps, content_norm_diagnostics = diagnose_content_attention(
+                    content_norm_inputs["content_logits"][local_index].detach().float().cpu().numpy(),
+                    content_norm_inputs["content_cosine_logits"][local_index].detach().float().cpu().numpy(),
+                    content_norm_inputs["key_norm"][local_index].detach().float().cpu().numpy(),
+                )
+                row.update({
+                    f"content_norm_{key}": value
+                    for key, value in content_norm_diagnostics.items()
+                })
+                for diagnostic_name, diagnostic_part_maps in content_norm_maps.items():
+                    grid = diagnostic_part_maps.reshape(
+                        diagnostic_part_maps.shape[0], part_maps.shape[1], part_maps.shape[2]
+                    )
+                    mean_map = aggregate_evidence_maps(grid, "mean")
+                    dense_map = token_vector_to_dense(mean_map.reshape(-1), image_size)
+                    diagnostic_metrics = evaluate_heatmap(dense_map, foreground, args.top_fraction)
+                    row.update({
+                        f"content_norm_{diagnostic_name}_{key}": value
+                        for key, value in diagnostic_metrics.items()
                     })
 
             if flipped_part_attention is not None:
@@ -972,6 +1057,21 @@ def main():
                     },
                     interpolation=args.attention_interpolation,
                 )
+            if (
+                args.content_norm_diagnostic
+                and content_norm_maps is not None
+                and global_index < args.save_content_norm_maps
+            ):
+                save_content_norm_figure(
+                    output_dir / f"content_norm_{global_index:05d}.png",
+                    input_tensor_to_pil(images[local_index]),
+                    {
+                        name: value.reshape(value.shape[0], part_maps.shape[1], part_maps.shape[2])
+                        for name, value in content_norm_maps.items()
+                    },
+                    part_maps,
+                    interpolation=args.attention_interpolation,
+                )
             global_index += 1
 
         if batch_index % 20 == 0:
@@ -995,6 +1095,10 @@ def main():
                 "attention_decomposition_definition": (
                     "final Part-attention logits reconstructed as content + gated semantic similarity + "
                     "gated log1p curvature; component maps are spatial Softmax diagnostics of the same logits"
+                ),
+                "content_norm_diagnostic_definition": (
+                    "raw q-k content attention versus cosine q-k attention rescaled to equal centered RMS, "
+                    "plus the spatial key-norm distribution; diagnostics do not change model predictions"
                 ),
                 "evidence_consensus_definition": (
                     "modal spatial peak across unconstrained Softmax evidence tokens; "

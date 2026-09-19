@@ -4,6 +4,7 @@ from localization_metrics import (
     aggregate_evidence_maps,
     box_iou_from_masks,
     decompose_part_attention_logits,
+    diagnose_content_attention,
     evaluate_evidence_consensus,
     evaluate_heatmap,
     evaluate_part_points,
@@ -130,3 +131,15 @@ def test_attention_logit_decomposition_reconstructs_observed_softmax():
     assert np.allclose(maps["final"], observed)
     assert metrics["softmax_reconstruction_max_abs_error"] < 1e-12
     assert metrics["content_peak_agreement_with_final"] == 1.0
+
+
+def test_content_norm_diagnostic_matches_sharpness():
+    raw = np.asarray([[0.0, 2.0, -1.0], [1.0, -0.5, 0.0]])
+    cosine = np.asarray([[0.0, 0.5, -0.25], [0.2, -0.1, 0.0]])
+    key_norm = np.asarray([1.0, 3.0, 2.0])
+    maps, metrics = diagnose_content_attention(raw, cosine, key_norm)
+    assert maps["raw_content"].shape == raw.shape
+    assert maps["cosine_content"].shape == raw.shape
+    assert maps["key_norm"].shape == (1, 3)
+    assert np.allclose(maps["key_norm"].sum(), 1.0)
+    assert metrics["raw_cosine_peak_agreement"] == 1.0

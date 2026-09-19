@@ -183,6 +183,23 @@ correlation with the final logits, peak agreement, localization metrics for
 each component, and the Softmax reconstruction error. This is a diagnostic of
 the existing Softmax attention, not a different attribution method.
 
+If Content dominates, diagnose whether raw dot-product key norms create the
+boundary peak. This does not alter predictions:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200vis/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200vis/best.pth \
+  --out output/content_norm_diagnostic_layer2 \
+  --layer 2 --map-sources part_attention \
+  --max-images 200 --sample-mode stratified \
+  --content-norm-diagnostic --save-content-norm-maps 20
+```
+
+This diagnostic requires the updated `SemanticPartTokenGeneratorV6.py` and
+`MetaFG_meta.py`, which expose detached raw content logits, cosine content
+logits, and key norms only when `return_aux=True`.
+
 `evidence_consensus_ratio` measures how many evidence tokens share the modal
 peak and is descriptive rather than an optimization target. A positive
 `causal_consensus_minus_random_foreground_target_probability_drop` means that

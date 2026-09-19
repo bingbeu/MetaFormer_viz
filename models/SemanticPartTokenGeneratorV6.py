@@ -288,7 +288,18 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         k = self.key_proj(weighted_x)
         v = self.value_proj(weighted_x)
 
-        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        # Exact content term plus detached norm/direction diagnostics.
+        # content_logits is numerically identical to the historical q-k term;
+        # the additional tensors are exposed only when return_aux=True.
+        content_logits = (q @ k.transpose(-2, -1)) * self.scale
+        content_cosine_logits = (
+            F.normalize(q.float(), dim=-1)
+            @ F.normalize(k.float(), dim=-1).transpose(-2, -1)
+        )
+        key_norm = k.float().norm(dim=-1)
+        query_norm = q.float().norm(dim=-1)
+
+        attn_logits = content_logits
         attn_logits = attn_logits + self.sim_logit_alpha.tanh() * token_part_sim.transpose(1, 2)
         attn_logits = attn_logits + self.curv_logit_alpha.tanh() * torch.log1p(curvature).transpose(1, 2)
 
@@ -344,6 +355,10 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                 "cls_sem": cls_sem.detach(),          # [V6]
 
                 # 最终 Part Token 的真实空间注意力（dropout 前，推荐用于可视化）
+                "content_logits": content_logits.detach(),
+                "content_cosine_logits": content_cosine_logits.detach(),
+                "key_norm": key_norm.detach(),
+                "query_norm": query_norm.detach(),
                 "attn_logits": attn_logits.detach(),
                 "attn_raw": attn_raw.detach(),
                 "part_attn": attn_raw.detach(),       # 语义清晰的别名
