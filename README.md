@@ -231,6 +231,12 @@ python main.py --cfg <config.yaml> --eval --resume <checkpoint.pth> \
 
 `MODEL.CONTENT_ATTENTION_MODE` defaults to `raw` for backward compatibility.
 
+For sharp, publication-facing maps, use `cosine_rms`. It removes spatial
+key-norm bias like `cosine_mean_norm`, but matches every Part token's centered
+raw-logit RMS so Softmax sharpness is not lost. The summary additionally
+reports normalized entropy, effective-support fraction, and peak-over-uniform
+ratio; these must be inspected together with localization metrics.
+
 `evidence_consensus_ratio` measures how many evidence tokens share the modal
 peak and is descriptive rather than an optimization target. A positive
 `causal_consensus_minus_random_foreground_target_probability_drop` means that

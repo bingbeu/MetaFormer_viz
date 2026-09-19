@@ -101,6 +101,9 @@ def test_attention_probability_validation():
     result = validate_evidence_attention(maps)
     assert result["probability_valid"] == 1.0
     assert np.isclose(result["probability_sum_mean"], 1.0)
+    assert np.isclose(result["normalized_entropy_mean"], 1.0)
+    assert np.isclose(result["effective_support_fraction_mean"], 1.0)
+    assert np.isclose(result["peak_over_uniform_mean"], 1.0)
 
     invalid = maps.copy()
     invalid[0] *= 2.0

@@ -96,7 +96,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
 
     # ------------------------------------------------------------------ utils
     def set_content_attention_mode(self, mode: str):
-        valid_modes = {"raw", "cosine_mean_norm"}
+        valid_modes = {"raw", "cosine_mean_norm", "cosine_rms"}
         if mode not in valid_modes:
             raise ValueError(
                 f"content_attention_mode must be one of {sorted(valid_modes)}, got {mode!r}"
@@ -318,10 +318,33 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             content_cosine_logits * mean_norm_scale
         ).to(dtype=raw_content_logits.dtype)
 
+        # Match the centered RMS of the historical logits per sample and Part
+        # token. This preserves their learned Softmax sharpness while removing
+        # spatial key-norm bias. Detaching the scale prevents norm magnitude
+        # from becoming an indirect spatial attention path during fine-tuning.
+        raw_centered = raw_content_logits.float() - raw_content_logits.float().mean(
+            dim=-1, keepdim=True
+        )
+        cosine_centered = content_cosine_logits - content_cosine_logits.mean(
+            dim=-1, keepdim=True
+        )
+        raw_rms = torch.sqrt(
+            raw_centered.square().mean(dim=-1, keepdim=True).clamp_min(self.eps ** 2)
+        )
+        cosine_rms = torch.sqrt(
+            cosine_centered.square().mean(dim=-1, keepdim=True).clamp_min(self.eps ** 2)
+        )
+        rms_scale = (raw_rms / cosine_rms).detach()
+        cosine_rms_logits = (
+            cosine_centered * rms_scale
+        ).to(dtype=raw_content_logits.dtype)
+
         if self.content_attention_mode == "raw":
             content_logits = raw_content_logits
         elif self.content_attention_mode == "cosine_mean_norm":
             content_logits = cosine_mean_norm_logits
+        elif self.content_attention_mode == "cosine_rms":
+            content_logits = cosine_rms_logits
         else:  # Defensive guard if an external caller mutates the attribute.
             raise RuntimeError(
                 f"unsupported content_attention_mode={self.content_attention_mode!r}"
@@ -388,6 +411,8 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                 "content_cosine_logits": content_cosine_logits.detach(),
                 "cosine_mean_norm_logits": cosine_mean_norm_logits.detach(),
                 "content_mean_norm_scale": mean_norm_scale.detach(),
+                "cosine_rms_logits": cosine_rms_logits.detach(),
+                "content_rms_scale": rms_scale.detach(),
                 "content_attention_mode": self.content_attention_mode,
                 "key_norm": key_norm.detach(),
                 "query_norm": query_norm.detach(),

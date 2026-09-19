@@ -160,11 +160,12 @@ def parse_args():
     )
     parser.add_argument(
         "--content-attention-mode",
-        choices=("raw", "cosine_mean_norm"),
+        choices=("raw", "cosine_mean_norm", "cosine_rms"),
         default="raw",
         help=(
             "Actual content term used to form Part tokens. raw preserves the checkpoint behavior; "
-            "cosine_mean_norm removes spatial key-norm bias while retaining mean-norm sharpness."
+            "cosine_mean_norm removes spatial key-norm bias with mean-norm scale; "
+            "cosine_rms additionally matches each raw Part token's centered-RMS sharpness."
         ),
     )
     parser.add_argument(

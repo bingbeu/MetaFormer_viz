@@ -243,12 +243,24 @@ def validate_evidence_attention(part_maps: np.ndarray, atol: float = 1e-3) -> Di
     max_sum_error = float(np.max(np.abs(sums - 1.0)))
     minimum = float(maps.min())
     valid = minimum >= -atol and max_sum_error <= atol
+    flat = np.maximum(maps.reshape(len(maps), -1), 0.0)
+    probabilities = flat / np.maximum(flat.sum(axis=1, keepdims=True), EPS)
+    token_count = probabilities.shape[1]
+    entropy = -np.sum(
+        probabilities * np.log(np.maximum(probabilities, EPS)), axis=1
+    )
+    normalized_entropy = entropy / np.log(max(token_count, 2))
+    effective_support_fraction = np.exp(entropy) / float(token_count)
+    peak_over_uniform = probabilities.max(axis=1) * float(token_count)
     return {
         "probability_valid": float(valid),
         "probability_sum_mean": float(sums.mean()),
         "probability_sum_max_abs_error": max_sum_error,
         "minimum": minimum,
         "maximum": float(maps.max()),
+        "normalized_entropy_mean": float(normalized_entropy.mean()),
+        "effective_support_fraction_mean": float(effective_support_fraction.mean()),
+        "peak_over_uniform_mean": float(peak_over_uniform.mean()),
     }
 
 
