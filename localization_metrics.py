@@ -151,6 +151,75 @@ def part_peak_points(part_maps: np.ndarray, image_shape: Sequence[int]) -> np.nd
     return np.asarray(points, dtype=np.float64)
 
 
+def evaluate_evidence_consensus(
+    part_maps: np.ndarray,
+    foreground_mask: np.ndarray,
+    gt_points: Optional[np.ndarray] = None,
+    normalization_length: Optional[float] = None,
+) -> Dict[str, float]:
+    """Measure agreement and localization of unconstrained evidence tokens.
+
+    Tokens are allowed to share a peak.  The modal token-grid peak is treated
+    as their consensus evidence location; agreement is descriptive rather than
+    an objective that must be maximized or minimized.
+    """
+    maps = np.asarray(part_maps, dtype=np.float64)
+    fg = np.asarray(foreground_mask, dtype=bool)
+    if maps.ndim != 3:
+        raise ValueError(f"part_maps must be [P,H,W], got {maps.shape}")
+    if fg.ndim != 2 or len(maps) == 0:
+        raise ValueError("foreground_mask must be 2-D and part_maps non-empty")
+
+    num_parts, grid_h, grid_w = maps.shape
+    peak_ids = np.asarray([
+        int(np.nanargmax(np.nan_to_num(m, nan=-np.inf))) for m in maps
+    ])
+    counts = np.bincount(peak_ids, minlength=grid_h * grid_w)
+    consensus_id = int(np.argmax(counts))
+    row, col = np.unravel_index(consensus_id, (grid_h, grid_w))
+    height, width = fg.shape
+    x = (col + 0.5) * width / grid_w
+    y = (row + 0.5) * height / grid_h
+    pixel_x = min(width - 1, max(0, int(x)))
+    pixel_y = min(height - 1, max(0, int(y)))
+    border_distance = min(x, y, width - x, height - y) / max(min(height, width), 1)
+
+    out = {
+        "consensus_x": float(x),
+        "consensus_y": float(y),
+        "consensus_ratio": float(counts[consensus_id] / num_parts),
+        "unique_peak_ratio": float(len(np.unique(peak_ids)) / num_parts),
+        "consensus_foreground_hit": float(fg[pixel_y, pixel_x]),
+        "consensus_border_distance": float(border_distance),
+    }
+
+    points = np.asarray(gt_points if gt_points is not None else [], dtype=np.float64).reshape(-1, 2)
+    if len(points) and normalization_length is not None and normalization_length > EPS:
+        distance = np.linalg.norm(points - np.asarray([x, y]), axis=1).min()
+        out["consensus_nearest_gt_nme"] = float(distance / normalization_length)
+    else:
+        out["consensus_nearest_gt_nme"] = float("nan")
+    return out
+
+
+def square_deletion_mask(
+    image_shape: Sequence[int],
+    point: Sequence[float],
+    side_fraction: float,
+) -> np.ndarray:
+    """Return a fixed-area square containing ``point`` and clipped by shifting."""
+    if not 0.0 < side_fraction <= 1.0:
+        raise ValueError("side_fraction must be in (0, 1]")
+    height, width = int(image_shape[0]), int(image_shape[1])
+    side = max(1, int(round(min(height, width) * side_fraction)))
+    x, y = float(point[0]), float(point[1])
+    x1 = min(max(int(round(x - side / 2.0)), 0), max(width - side, 0))
+    y1 = min(max(int(round(y - side / 2.0)), 0), max(height - side, 0))
+    mask = np.zeros((height, width), dtype=bool)
+    mask[y1:y1 + side, x1:x1 + side] = True
+    return mask
+
+
 def evaluate_part_points(
     predicted_points: np.ndarray,
     gt_points: np.ndarray,
