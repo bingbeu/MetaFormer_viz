@@ -122,7 +122,8 @@ actual pre-dropout attention used to form part tokens against the official CUB
 bounding boxes and visible part keypoints. It reports pointing-game accuracy,
 top-fraction pixel IoU, predicted-box IoU, IoU@0.5 localization accuracy,
 foreground energy/concentration, top-k foreground precision, Hungarian-matched
-part NME/PCK, GT-part coverage, predicted-part precision, and part diversity.
+part NME/PCK, GT-part coverage, and Softmax evidence-token consensus. Shared
+token peaks are treated as agreement, not automatically as part collapse.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
@@ -137,6 +138,31 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
   --bootstrap-samples 2000
 ```
 
+To test whether a shared token peak is causally discriminative rather than a
+background/position shortcut, enable fixed-area deletion and flip stability:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_localization.py \
+  --cfg output/MetaFG_meta_2/cub-200-Curv-Part/config.json \
+  --ckpt output/MetaFG_meta_2/cub-200-Curv-Part/best.pth \
+  --out output/localization_causal_layer2 \
+  --layer 2 \
+  --map-sources curvature part_attention \
+  --batch-size 1 \
+  --causal-deletion \
+  --deletion-size 0.15 \
+  --deletion-random-samples 5 \
+  --deletion-batch-size 4 \
+  --flip-stability
+```
+
+`evidence_consensus_ratio` measures how many evidence tokens share the modal
+peak and is descriptive rather than an optimization target. A positive
+`causal_consensus_minus_random_foreground_target_probability_drop` means that
+masking the consensus patch hurts the target-class confidence more than masking
+matched random foreground patches. Lower `evidence_flip_stability_nme` means
+the consensus location is more stable after horizontal-flip inversion.
+
 Use `--max-images 100` for a quick smoke test. Add `hvp_curvature` to
 `--map-sources` only when teacher localization is needed; it computes HVPs and
 is much slower, so use batch size 1 or 2. Optional true foreground masks can be
@@ -149,4 +175,5 @@ Outputs:
 - `localization_per_image.csv`: one row per test image;
 - `localization_summary.csv`: mean, standard deviation, and bootstrap 95% CI;
 - `localization_summary.json`: metric definitions and run configuration;
-- `overlay_*.jpg`: green box, cyan GT parts, and yellow predicted part peaks.
+- `overlay_*.jpg`: green box, cyan GT parts, yellow token peaks, and a magenta
+  circle around the consensus evidence peak.
