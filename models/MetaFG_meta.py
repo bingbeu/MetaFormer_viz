@@ -73,6 +73,7 @@ class MetaFG_Meta(nn.Module):
                 category_emb_path: str = None,   # 类别名文本库 .npy [num_classes, 768]
                 temperature: float = 1.0,         # 类别路由 softmax 温度
                 lambda_route: float = 0.1,        # loss_route 权重
+                content_attention_mode: str = "raw",
                 use_checkpoint=False):
         super().__init__()
         self.only_last_cls = only_last_cls
@@ -141,7 +142,8 @@ class MetaFG_Meta(nn.Module):
             hvp_probe=hvp_probe,
             hvp_samples=hvp_samples,
             curv_tau=curv_tau,
-            curv_reg_weight=curv_reg_weight
+            curv_reg_weight=curv_reg_weight,
+            content_attention_mode=content_attention_mode,
         )
         self.part_gen_2 = SemanticPartTokenGeneratorV6(
             in_dim=attn_embed_dims[0],
@@ -152,7 +154,8 @@ class MetaFG_Meta(nn.Module):
             hvp_probe=hvp_probe,
             hvp_samples=hvp_samples,
             curv_tau=curv_tau,
-            curv_reg_weight=curv_reg_weight
+            curv_reg_weight=curv_reg_weight,
+            content_attention_mode=content_attention_mode,
         )
         stem_chs = (3 * (conv_embed_dims[0] // 4), conv_embed_dims[0])
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(conv_depths[1:]+attn_depths))]
@@ -407,6 +410,26 @@ class MetaFG_Meta(nn.Module):
                 # attn_raw = softmax(attn_logits) BEFORE attention dropout.
                 # This is the correct quantity for Part heatmaps/diversity.
                 # ============================================================
+                "content_logits_1": aux_1.get("content_logits", None),
+                "content_logits_2": aux_2.get("content_logits", None),
+                "raw_content_logits_1": aux_1.get("raw_content_logits", None),
+                "raw_content_logits_2": aux_2.get("raw_content_logits", None),
+                "content_cosine_logits_1": aux_1.get("content_cosine_logits", None),
+                "content_cosine_logits_2": aux_2.get("content_cosine_logits", None),
+                "cosine_mean_norm_logits_1": aux_1.get("cosine_mean_norm_logits", None),
+                "cosine_mean_norm_logits_2": aux_2.get("cosine_mean_norm_logits", None),
+                "content_mean_norm_scale_1": aux_1.get("content_mean_norm_scale", None),
+                "content_mean_norm_scale_2": aux_2.get("content_mean_norm_scale", None),
+                "cosine_rms_logits_1": aux_1.get("cosine_rms_logits", None),
+                "cosine_rms_logits_2": aux_2.get("cosine_rms_logits", None),
+                "content_rms_scale_1": aux_1.get("content_rms_scale", None),
+                "content_rms_scale_2": aux_2.get("content_rms_scale", None),
+                "content_attention_mode_1": aux_1.get("content_attention_mode", "raw"),
+                "content_attention_mode_2": aux_2.get("content_attention_mode", "raw"),
+                "key_norm_1": aux_1.get("key_norm", None),
+                "key_norm_2": aux_2.get("key_norm", None),
+                "query_norm_1": aux_1.get("query_norm", None),
+                "query_norm_2": aux_2.get("query_norm", None),
                 "attn_logits_1": aux_1.get("attn_logits", None),
                 "attn_logits_2": aux_2.get("attn_logits", None),
                 "attn_raw_1": aux_1.get("attn_raw", None),

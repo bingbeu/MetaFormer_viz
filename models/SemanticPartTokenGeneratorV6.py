@@ -34,6 +34,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         feat_gain_max: float = 0.25,
         use_category_grounding: bool = True,   # [V6-3] 类别接地开关
         category_scale: float = 0.5,           # [V6] 类别注入强度 γ_cls 的初始生效值
+        content_attention_mode: str = "raw",
     ):
         super().__init__()
         if curv_tau <= 0:
@@ -56,6 +57,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         self.use_category_grounding = use_category_grounding
         self.scale = embed_dim ** -0.5
         self.eps = 1e-6
+        self.set_content_attention_mode(content_attention_mode)
 
         self.input_proj = nn.Linear(in_dim, embed_dim)
         self.class_proj = nn.Linear(embed_dim, embed_dim)    # [V6] 类别语义投影 c
@@ -93,6 +95,14 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         trunc_normal_(self.part_queries, std=0.02)
 
     # ------------------------------------------------------------------ utils
+    def set_content_attention_mode(self, mode: str):
+        valid_modes = {"raw", "cosine_mean_norm", "cosine_rms"}
+        if mode not in valid_modes:
+            raise ValueError(
+                f"content_attention_mode must be one of {sorted(valid_modes)}, got {mode!r}"
+            )
+        self.content_attention_mode = mode
+
     def gate_status(self):
         with torch.no_grad():
             return {
@@ -288,7 +298,59 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         k = self.key_proj(weighted_x)
         v = self.value_proj(weighted_x)
 
-        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        # Raw historical q-k term plus a norm-decoupled alternative.
+        # The default mode is raw, so old configs/checkpoints remain numerically
+        # unchanged. cosine_mean_norm removes spatial key-norm variation while
+        # retaining a per-image/per-Part-token scale estimated from mean norms.
+        raw_content_logits = (q @ k.transpose(-2, -1)) * self.scale
+        content_cosine_logits = (
+            F.normalize(q.float(), dim=-1)
+            @ F.normalize(k.float(), dim=-1).transpose(-2, -1)
+        )
+        key_norm = k.float().norm(dim=-1)
+        query_norm = q.float().norm(dim=-1)
+        mean_norm_scale = (
+            query_norm.unsqueeze(-1)
+            * key_norm.mean(dim=-1, keepdim=True).unsqueeze(1)
+            * self.scale
+        )
+        cosine_mean_norm_logits = (
+            content_cosine_logits * mean_norm_scale
+        ).to(dtype=raw_content_logits.dtype)
+
+        # Match the centered RMS of the historical logits per sample and Part
+        # token. This preserves their learned Softmax sharpness while removing
+        # spatial key-norm bias. Detaching the scale prevents norm magnitude
+        # from becoming an indirect spatial attention path during fine-tuning.
+        raw_centered = raw_content_logits.float() - raw_content_logits.float().mean(
+            dim=-1, keepdim=True
+        )
+        cosine_centered = content_cosine_logits - content_cosine_logits.mean(
+            dim=-1, keepdim=True
+        )
+        raw_rms = torch.sqrt(
+            raw_centered.square().mean(dim=-1, keepdim=True).clamp_min(self.eps ** 2)
+        )
+        cosine_rms = torch.sqrt(
+            cosine_centered.square().mean(dim=-1, keepdim=True).clamp_min(self.eps ** 2)
+        )
+        rms_scale = (raw_rms / cosine_rms).detach()
+        cosine_rms_logits = (
+            cosine_centered * rms_scale
+        ).to(dtype=raw_content_logits.dtype)
+
+        if self.content_attention_mode == "raw":
+            content_logits = raw_content_logits
+        elif self.content_attention_mode == "cosine_mean_norm":
+            content_logits = cosine_mean_norm_logits
+        elif self.content_attention_mode == "cosine_rms":
+            content_logits = cosine_rms_logits
+        else:  # Defensive guard if an external caller mutates the attribute.
+            raise RuntimeError(
+                f"unsupported content_attention_mode={self.content_attention_mode!r}"
+            )
+
+        attn_logits = content_logits
         attn_logits = attn_logits + self.sim_logit_alpha.tanh() * token_part_sim.transpose(1, 2)
         attn_logits = attn_logits + self.curv_logit_alpha.tanh() * torch.log1p(curvature).transpose(1, 2)
 
@@ -344,6 +406,16 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                 "cls_sem": cls_sem.detach(),          # [V6]
 
                 # 最终 Part Token 的真实空间注意力（dropout 前，推荐用于可视化）
+                "content_logits": content_logits.detach(),
+                "raw_content_logits": raw_content_logits.detach(),
+                "content_cosine_logits": content_cosine_logits.detach(),
+                "cosine_mean_norm_logits": cosine_mean_norm_logits.detach(),
+                "content_mean_norm_scale": mean_norm_scale.detach(),
+                "cosine_rms_logits": cosine_rms_logits.detach(),
+                "content_rms_scale": rms_scale.detach(),
+                "content_attention_mode": self.content_attention_mode,
+                "key_norm": key_norm.detach(),
+                "query_norm": query_norm.detach(),
                 "attn_logits": attn_logits.detach(),
                 "attn_raw": attn_raw.detach(),
                 "part_attn": attn_raw.detach(),       # 语义清晰的别名
