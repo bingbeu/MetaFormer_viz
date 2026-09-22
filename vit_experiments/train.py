@@ -66,6 +66,12 @@ def parse_args():
     parser.add_argument("--curv-reg-weight", type=float, default=0.1)
     parser.add_argument("--part-loss-weight", type=float, default=0.1)
     parser.add_argument("--route-loss-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--ablation",
+        choices=("full", "no_hvp", "no_curvature"),
+        default="full",
+        help="Curv-Part mode; baseline ignores this option.",
+    )
     parser.add_argument("--semantic-root", default=None)
     parser.add_argument("--semantic-key", default="embedding_words")
     parser.add_argument("--semantic-dim", type=int, default=768)
