@@ -24,6 +24,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         num_parts: int,
         attn_drop: float = 0.0,
         enable_hvp: bool = True,
+        enable_curvature: bool = True,
         assign_scale: float = 5.0,
         curv_tau: float = 1.0,
         hvp_probe: str = "rademacher",
@@ -45,6 +46,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         self.embed_dim = embed_dim
         self.num_parts = num_parts
         self.enable_hvp = enable_hvp
+        self.enable_curvature = enable_curvature
         self.assign_scale = assign_scale
         self.curv_tau = max(curv_tau, 0.1)
         self.hvp_probe = hvp_probe
@@ -227,7 +229,8 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         # 可视化/评估时可在 model.eval() 下显式 force_hvp=True，额外计算 Teacher，
         # 不改变任何可训练参数，也不改变分类/part-token 前向结果。
         if (
-            (self.enable_hvp or force_hvp)
+            self.enable_curvature
+            and (self.enable_hvp or force_hvp)
             and (self.training or force_hvp)
             and torch.is_grad_enabled()
         ):
@@ -267,7 +270,13 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             curv_reg_loss = F.smooth_l1_loss(student_curvature_reg, teacher_curvature)
 
         # 后续使用预测曲率
-        curvature = self._normalize_curvature(pred_curvature)
+        if self.enable_curvature:
+            curvature = self._normalize_curvature(pred_curvature)
+        else:
+            # Uniform importance gives a parameter-matched Part-Token control.
+            # The zero-valued dependency keeps curv_head parameters in the DDP
+            # graph without allowing them to affect the forward result.
+            curvature = torch.ones_like(pred_curvature) + 0.0 * pred_curvature
         curv_logits = curvature.squeeze(-1) / self.curv_tau
         curv_prob = torch.softmax(curv_logits, dim=1)                          # (B,N) Σ=1
         curv_weight = (N * curv_prob).clamp(max=self.curv_weight_max)          # (B,N) 有界
