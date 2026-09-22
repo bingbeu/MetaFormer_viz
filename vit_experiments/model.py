@@ -69,9 +69,13 @@ class CurvPartViT(nn.Module):
         hvp_samples=4,
         curv_tau=1.0,
         curv_reg_weight=0.1,
+        ablation="full",
     ):
         super().__init__()
         self.backbone = _make_vit(backbone, pretrained, num_classes, drop_path)
+        if ablation not in {"full", "no_hvp", "no_curvature"}:
+            raise ValueError(f"Unknown Curv-Part ablation: {ablation}")
+        self.ablation = ablation
         if not hasattr(self.backbone, "blocks") or not hasattr(self.backbone, "patch_embed"):
             raise TypeError(f"{backbone} is not a standard timm VisionTransformer")
         if getattr(self.backbone, "dist_token", None) is not None:
@@ -100,7 +104,8 @@ class CurvPartViT(nn.Module):
                 in_dim=self.embed_dim,
                 embed_dim=self.embed_dim,
                 num_parts=num_parts,
-                enable_hvp=True,
+                enable_hvp=ablation == "full",
+                enable_curvature=ablation != "no_curvature",
                 hvp_samples=hvp_samples,
                 curv_tau=curv_tau,
                 curv_reg_weight=curv_reg_weight,
@@ -210,5 +215,6 @@ def build_model(args):
             hvp_samples=args.hvp_samples,
             curv_tau=args.curv_tau,
             curv_reg_weight=args.curv_reg_weight,
+            ablation=args.ablation,
         )
     raise ValueError(f"Unknown model: {args.model}")
