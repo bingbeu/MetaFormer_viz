@@ -91,3 +91,12 @@ torchrun --standalone --nproc_per_node=2 -m vit_experiments.train \
 When evaluating a text-conditioned checkpoint, pass the same `--semantic-root` and
 `--category-bank` arguments used for training. Report at least three seeds for the
 final comparison; keep every argument except `--model` and output path identical.
+
+## Curvature controls
+
+Use `--ablation no_hvp` to keep the first-order importance student while removing
+its training-only HVP supervision. Use `--ablation no_curvature` for a
+parameter-matched Part-Token control with uniform token importance: it disables
+the HVP teacher, curvature regression, feature modulation, curvature weighting,
+and the token-dependent curvature attention bias. The default `--ablation full`
+is unchanged.
