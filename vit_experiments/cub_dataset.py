@@ -93,6 +93,8 @@ class CUB200(Dataset):
                 f"Expected [tokens, {self.semantic_dim}] in {semantic_path}, got {value.shape}"
             )
         value = value[: self.max_semantic_tokens]
+        if len(value) == 0:
+            raise ValueError(f"Semantic feature contains no tokens: {semantic_path}")
         # The generator has no padding mask. Fill unused slots with the sample's
         # mean semantic vector instead of introducing artificial zero tokens.
         output = np.repeat(
