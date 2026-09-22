@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--accum-steps", type=int, default=2)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=6.25e-6)
+    parser.add_argument("--warmup-start-lr", type=float, default=6.25e-9)
     parser.add_argument("--min-lr", type=float, default=6.25e-8)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--clip-grad", type=float, default=5.0)
@@ -216,9 +217,10 @@ def evaluate(model, loader, device, distributed):
     }
 
 
-def lr_factor(step, warmup_steps, total_steps, min_ratio):
+def lr_factor(step, warmup_steps, total_steps, min_ratio, warmup_start_ratio):
     if step < warmup_steps:
-        return float(step + 1) / max(1, warmup_steps)
+        progress = float(step) / max(1, warmup_steps - 1)
+        return warmup_start_ratio + (1.0 - warmup_start_ratio) * progress
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
     return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
 
@@ -263,6 +265,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, args, e
                 args.warmup_epochs * math.ceil(len(loader) / args.accum_steps),
                 total_updates,
                 args.min_lr / args.lr,
+                args.warmup_start_lr / args.lr,
             )
             for group in optimizer.param_groups:
                 group["lr"] = args.lr * factor
@@ -287,6 +290,10 @@ def load_weights(model, path, optimizer=None, scaler=None):
 
 def main():
     args = parse_args()
+    if not (0.0 < args.warmup_start_lr <= args.lr):
+        raise ValueError("Require 0 < warmup-start-lr <= lr")
+    if not (0.0 < args.min_lr <= args.lr):
+        raise ValueError("Require 0 < min-lr <= lr")
     distributed, rank, local_rank, world_size = distributed_setup()
     if not torch.cuda.is_available():
         raise RuntimeError("This training entry point requires CUDA.")
