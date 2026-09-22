@@ -21,6 +21,11 @@ from torchvision.transforms import InterpolationMode
 from vit_experiments.cub_dataset import CUB200
 from vit_experiments.model import build_model
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser("Matched CUB ViT experiments")
@@ -40,6 +45,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=16, help="Per GPU")
     parser.add_argument("--accum-steps", type=int, default=2)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--lr", type=float, default=6.25e-6)
     parser.add_argument("--warmup-start-lr", type=float, default=6.25e-9)
     parser.add_argument("--min-lr", type=float, default=6.25e-8)
@@ -225,14 +232,25 @@ def lr_factor(step, warmup_steps, total_steps, min_ratio, warmup_start_ratio):
     return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
 
 
-def train_one_epoch(model, loader, optimizer, scaler, criterion, device, args, epoch, update_step, total_updates):
+def train_one_epoch(
+    model, loader, optimizer, scaler, criterion, device, args, epoch,
+    update_step, total_updates, rank, output,
+):
     model.train()
     raw_model = model.module if hasattr(model, "module") else model
     freeze = epoch < args.freeze_backbone_epochs
 
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
-    for iteration, (images, hard_target, semantics) in enumerate(loader):
+    progress = loader
+    if rank == 0 and not args.no_progress and tqdm is not None:
+        progress = tqdm(
+            loader,
+            total=len(loader),
+            desc=f"Train [{epoch + 1}/{args.epochs}]",
+            dynamic_ncols=True,
+        )
+    for iteration, (images, hard_target, semantics) in enumerate(progress):
         images = images.to(device, non_blocking=True)
         hard_target = hard_target.to(device, non_blocking=True)
         semantics = semantics.to(device, non_blocking=True)
@@ -243,11 +261,17 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, args, e
             if args.model == "curvpart_vit":
                 logits, aux = model(mixed_images, semantics, return_aux=True)
                 warm = args.part_loss_weight * min(1.0, float(epoch + 1) / args.warmup_epochs)
-                loss = criterion(logits, target) + warm * aux["part_aux_loss"]
-                loss = loss + args.route_loss_weight * soft_cross_entropy(aux["route_logits"], target)
+                cls_loss = criterion(logits, target)
+                part_loss = aux["part_aux_loss"]
+                route_loss = soft_cross_entropy(aux["route_logits"], target)
+                loss = cls_loss + warm * part_loss + args.route_loss_weight * route_loss
             else:
                 logits = model(mixed_images, semantics)
-                loss = criterion(logits, target)
+                cls_loss = criterion(logits, target)
+                part_loss = cls_loss.new_zeros(())
+                route_loss = cls_loss.new_zeros(())
+                loss = cls_loss
+            unscaled_loss = loss.detach()
             loss = loss / args.accum_steps
 
         scaler.scale(loss).backward()
@@ -259,7 +283,7 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, args, e
                 # clearing its gradients only for the requested warm-start epochs.
                 for parameter in raw_model.backbone_parameters():
                     parameter.grad = None
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             factor = lr_factor(
                 update_step,
                 args.warmup_epochs * math.ceil(len(loader) / args.accum_steps),
@@ -273,7 +297,38 @@ def train_one_epoch(model, loader, optimizer, scaler, criterion, device, args, e
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             update_step += 1
-        running_loss += loss.detach().item() * args.accum_steps
+        running_loss += unscaled_loss.item()
+
+        should_log = rank == 0 and (
+            (iteration + 1) % args.log_interval == 0 or iteration + 1 == len(loader)
+        )
+        if should_log:
+            record = {
+                "epoch": epoch,
+                "iteration": iteration + 1,
+                "iterations": len(loader),
+                "update_step": update_step,
+                "lr": optimizer.param_groups[0]["lr"],
+                "loss": unscaled_loss.item(),
+                "cls_loss": cls_loss.detach().item(),
+                "part_loss": part_loss.detach().item(),
+                "route_loss": route_loss.detach().item(),
+                "memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 ** 2),
+            }
+            if should_update:
+                record["grad_norm"] = float(grad_norm)
+            with open(output / "train_steps.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+            if tqdm is not None and hasattr(progress, "set_postfix"):
+                progress.set_postfix(
+                    loss=f"{record['loss']:.4f}",
+                    cls=f"{record['cls_loss']:.4f}",
+                    part=f"{record['part_loss']:.4f}",
+                    lr=f"{record['lr']:.2e}",
+                    mem=f"{record['memory_mb']:.0f}M",
+                )
+            elif args.no_progress or tqdm is None:
+                print(json.dumps(record), flush=True)
     return running_loss / len(loader), update_step
 
 
@@ -294,6 +349,8 @@ def main():
         raise ValueError("Require 0 < warmup-start-lr <= lr")
     if not (0.0 < args.min_lr <= args.lr):
         raise ValueError("Require 0 < min-lr <= lr")
+    if args.batch_size < 1 or args.accum_steps < 1 or args.log_interval < 1:
+        raise ValueError("batch-size, accum-steps, and log-interval must be positive")
     distributed, rank, local_rank, world_size = distributed_setup()
     if not torch.cuda.is_available():
         raise RuntimeError("This training entry point requires CUDA.")
@@ -306,6 +363,15 @@ def main():
             json.dump(vars(args), handle, indent=2)
 
     train_loader, test_loader, train_sampler = build_loaders(args, distributed)
+    if rank == 0:
+        effective_batch = args.batch_size * world_size * args.accum_steps
+        print(
+            f"Batch size: {args.batch_size}/GPU x {world_size} GPU(s) x "
+            f"{args.accum_steps} accumulation = {effective_batch} effective",
+            flush=True,
+        )
+        if tqdm is None and not args.no_progress:
+            print("tqdm is not installed; falling back to periodic JSON progress logs.")
     model = build_model(args).to(device)
     if args.checkpoint:
         load_weights(model, args.checkpoint)
@@ -335,7 +401,7 @@ def main():
             train_sampler.set_epoch(epoch)
         train_loss, update_step = train_one_epoch(
             model, train_loader, optimizer, scaler, criterion, device,
-            args, epoch, update_step, total_updates,
+            args, epoch, update_step, total_updates, rank, output,
         )
         metrics = evaluate(model, test_loader, device, distributed)
         if rank == 0:
