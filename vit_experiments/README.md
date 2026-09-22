@@ -17,6 +17,14 @@ python -m vit_experiments.train --help
 `--data-path` accepts either the directory above or its parent
 `/raid/datasets/cub-200`. The loader always uses the official train/test split.
 
+`--batch-size` is the per-GPU batch size. The effective batch size is
+`batch-size x number of GPUs x accum-steps`; for example, the defaults give
+`16 x 2 x 2 = 64` on two GPUs. Training displays a rank-zero progress bar and
+writes step metrics to `train_steps.jsonl`, epoch metrics to `log.jsonl`, and
+arguments to `args.json` under the selected output directory. Use
+`--log-interval N` to control step-log frequency or `--no-progress` for plain
+JSON terminal output.
+
 ## Baseline
 
 Single GPU smoke test:
@@ -83,4 +91,3 @@ torchrun --standalone --nproc_per_node=2 -m vit_experiments.train \
 When evaluating a text-conditioned checkpoint, pass the same `--semantic-root` and
 `--category-bank` arguments used for training. Report at least three seeds for the
 final comparison; keep every argument except `--model` and output path identical.
-
