@@ -153,21 +153,47 @@ python -m vit_experiments.summarize_ablation \
 
 ## Empirical sensitivity validation
 
-This evaluation compares HVP, gradient, entropy, and student token rankings
-against an empirical central finite-difference estimate of the same
-visual--semantic compatibility objective. It is evaluation-only and defaults to
-a class-stratified subset of 200 CUB test images:
+This evaluation applies the same L2-norm perturbation to every visual token and
+compares six rankings on exactly the same visual--semantic compatibility
+objective: HVP teacher, distilled student, first-order gradient, entropy, actual
+Part attention, and a deterministic random control. It uses two empirical
+targets:
+
+1. the symmetric absolute objective change, which measures the total local
+   response to a small perturbation;
+2. the absolute central second difference, which isolates empirical
+   second-order sensitivity.
+
+The distinction is important: gradient is a natural control for total local
+change, whereas HVP should be evaluated primarily against the second-order
+response. The evaluation never updates the model or selects a checkpoint. It
+defaults to a class-stratified subset of 200 CUB test images:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m vit_experiments.sensitivity_eval \
   --checkpoint outputs/vit_controls/full_seed42/final.pth \
   --data-path "$CUB_ROOT" \
   --category-bank /raid/datasets/cub-200/category_embeddings.npy \
-  --max-images 200 --batch-size 4 --fd-eps 0.1 --fd-samples 4 \
+  --max-images 200 --batch-size 4 --fd-eps 0.1 --fd-samples 8 \
+  --top-fraction 0.1 --curve-fractions 0.05 0.1 0.2 0.3 \
+  --bootstrap-samples 5000 \
   --output outputs/vit_controls/sensitivity_seed42.json
 ```
 
-The JSON contains per-image values and aggregate mean/sample-SD for Spearman
-rank agreement and top-10% overlap. Run the diagnostic on all three full-model
-seeds if it will support a formal statistical claim; one seed is sufficient for
-a clearly labeled mechanism diagnostic.
+Four files are written:
+
+- `sensitivity_seed42.json`: complete protocol, summaries, paired deltas, and
+  per-image/per-layer records;
+- `sensitivity_seed42_summary.csv`: publication-facing means, sample SDs, and
+  bootstrap 95% confidence intervals;
+- `sensitivity_seed42_per_image.csv`: image-level results after averaging the
+  two insertion layers;
+- `sensitivity_seed42_per_image_layer.csv`: unaggregated diagnostic records.
+
+The top-k curve reports both response capture (the fraction of all empirical
+response contained in the selected tokens) and enrichment (selected-token mean
+response divided by the all-token mean). For a formal multi-seed mechanism
+claim, run the same command on `full_seed42`, `full_seed43`, and `full_seed44`
+with distinct output names. A single predeclared seed is acceptable only when
+the result is explicitly labeled as a mechanism diagnostic rather than a
+training-stability result.
