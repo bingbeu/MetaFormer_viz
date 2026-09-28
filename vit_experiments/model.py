@@ -73,7 +73,13 @@ class CurvPartViT(nn.Module):
     ):
         super().__init__()
         self.backbone = _make_vit(backbone, pretrained, num_classes, drop_path)
-        if ablation not in {"full", "no_hvp", "no_curvature"}:
+        if ablation not in {
+            "full",
+            "gradient_teacher",
+            "entropy_teacher",
+            "no_hvp",
+            "no_curvature",
+        }:
             raise ValueError(f"Unknown Curv-Part ablation: {ablation}")
         self.ablation = ablation
         if not hasattr(self.backbone, "blocks") or not hasattr(self.backbone, "patch_embed"):
@@ -99,6 +105,13 @@ class CurvPartViT(nn.Module):
             self.register_buffer("category_bank", bank, persistent=True)
 
         self.generators = nn.ModuleDict()
+        teacher_type = {
+            "full": "hvp",
+            "gradient_teacher": "gradient",
+            "entropy_teacher": "entropy",
+            "no_hvp": "none",
+            "no_curvature": "none",
+        }[ablation]
         for layer in self.insert_layers:
             self.generators[str(layer)] = SemanticPartTokenGeneratorV6(
                 in_dim=self.embed_dim,
@@ -106,6 +119,7 @@ class CurvPartViT(nn.Module):
                 num_parts=num_parts,
                 enable_hvp=ablation == "full",
                 enable_curvature=ablation != "no_curvature",
+                teacher_type=teacher_type,
                 hvp_samples=hvp_samples,
                 curv_tau=curv_tau,
                 curv_reg_weight=curv_reg_weight,
