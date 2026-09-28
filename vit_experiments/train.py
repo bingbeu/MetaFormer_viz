@@ -46,6 +46,15 @@ def parse_args():
     parser.add_argument("--accum-steps", type=int, default=2)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=0,
+        help=(
+            "Evaluate every N epochs; 0 evaluates only the fixed final epoch. "
+            "Test metrics are never used for checkpoint selection."
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--lr", type=float, default=6.25e-6)
     parser.add_argument("--warmup-start-lr", type=float, default=6.25e-9)
@@ -68,7 +77,13 @@ def parse_args():
     parser.add_argument("--route-loss-weight", type=float, default=0.1)
     parser.add_argument(
         "--ablation",
-        choices=("full", "no_hvp", "no_curvature"),
+        choices=(
+            "full",
+            "gradient_teacher",
+            "entropy_teacher",
+            "no_hvp",
+            "no_curvature",
+        ),
         default="full",
         help="Curv-Part mode; baseline ignores this option.",
     )
@@ -269,12 +284,16 @@ def train_one_epoch(
                 warm = args.part_loss_weight * min(1.0, float(epoch + 1) / args.warmup_epochs)
                 cls_loss = criterion(logits, target)
                 part_loss = aux["part_aux_loss"]
+                align_loss = aux["align_loss"]
+                curv_reg_loss = aux["curv_reg_loss"]
                 route_loss = soft_cross_entropy(aux["route_logits"], target)
                 loss = cls_loss + warm * part_loss + args.route_loss_weight * route_loss
             else:
                 logits = model(mixed_images, semantics)
                 cls_loss = criterion(logits, target)
                 part_loss = cls_loss.new_zeros(())
+                align_loss = cls_loss.new_zeros(())
+                curv_reg_loss = cls_loss.new_zeros(())
                 route_loss = cls_loss.new_zeros(())
                 loss = cls_loss
             unscaled_loss = loss.detach()
@@ -318,6 +337,8 @@ def train_one_epoch(
                 "loss": unscaled_loss.item(),
                 "cls_loss": cls_loss.detach().item(),
                 "part_loss": part_loss.detach().item(),
+                "align_loss": align_loss.detach().item(),
+                "curv_reg_loss": curv_reg_loss.detach().item(),
                 "route_loss": route_loss.detach().item(),
                 "memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 ** 2),
             }
@@ -355,8 +376,16 @@ def main():
         raise ValueError("Require 0 < warmup-start-lr <= lr")
     if not (0.0 < args.min_lr <= args.lr):
         raise ValueError("Require 0 < min-lr <= lr")
-    if args.batch_size < 1 or args.accum_steps < 1 or args.log_interval < 1:
-        raise ValueError("batch-size, accum-steps, and log-interval must be positive")
+    if (
+        args.batch_size < 1
+        or args.accum_steps < 1
+        or args.log_interval < 1
+        or args.eval_every < 0
+    ):
+        raise ValueError(
+            "batch-size, accum-steps, and log-interval must be positive; "
+            "eval-every must be non-negative"
+        )
     distributed, rank, local_rank, world_size = distributed_setup()
     if not torch.cuda.is_available():
         raise RuntimeError("This training entry point requires CUDA.")
@@ -367,6 +396,13 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         with open(output / "args.json", "w", encoding="utf-8") as handle:
             json.dump(vars(args), handle, indent=2)
+        if args.model == "curvpart_vit" and args.category_bank is None:
+            print(
+                "WARNING: --category-bank was not provided; this run uses a "
+                "learned random bank and does not match the paper's frozen-bank "
+                "protocol.",
+                flush=True,
+            )
 
     train_loader, test_loader, train_sampler = build_loaders(args, distributed)
     if rank == 0:
@@ -383,12 +419,11 @@ def main():
         load_weights(model, args.checkpoint)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=not args.no_amp)
-    start_epoch, update_step, best_acc = 0, 0, 0.0
+    start_epoch, update_step = 0, 0
     if args.resume:
         state = load_weights(model, args.resume, optimizer, scaler)
         start_epoch = state["epoch"] + 1
         update_step = state.get("update_step", 0)
-        best_acc = state.get("best_acc", 0.0)
 
     if distributed:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
@@ -402,6 +437,7 @@ def main():
     updates_per_epoch = math.ceil(len(train_loader) / args.accum_steps)
     total_updates = args.epochs * updates_per_epoch
     start = time.time()
+    metrics = None
     for epoch in range(start_epoch, args.epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
@@ -409,10 +445,20 @@ def main():
             model, train_loader, optimizer, scaler, criterion, device,
             args, epoch, update_step, total_updates, rank, output,
         )
-        metrics = evaluate(model, test_loader, device, distributed)
+        should_evaluate = (
+            epoch + 1 == args.epochs
+            or (args.eval_every > 0 and (epoch + 1) % args.eval_every == 0)
+        )
+        metrics = (
+            evaluate(model, test_loader, device, distributed)
+            if should_evaluate
+            else None
+        )
         if rank == 0:
             raw_model = model.module if hasattr(model, "module") else model
-            record = {"epoch": epoch, "train_loss": train_loss, **metrics}
+            record = {"epoch": epoch, "train_loss": train_loss}
+            if metrics is not None:
+                record.update(metrics)
             print(json.dumps(record))
             with open(output / "log.jsonl", "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record) + "\n")
@@ -422,16 +468,17 @@ def main():
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
                 "update_step": update_step,
-                "best_acc": max(best_acc, metrics["acc1"]),
                 "args": vars(args),
             }
             torch.save(state, output / "last.pth")
-            if metrics["acc1"] > best_acc:
-                best_acc = metrics["acc1"]
-                state["best_acc"] = best_acc
-                torch.save(state, output / "best.pth")
+            if epoch + 1 == args.epochs:
+                torch.save(state, output / "final.pth")
     if rank == 0:
-        print(f"Training time: {(time.time() - start) / 3600:.2f} h; best Acc@1: {best_acc:.2f}")
+        final_acc = "n/a" if metrics is None else f"{metrics['acc1']:.2f}"
+        print(
+            f"Training time: {(time.time() - start) / 3600:.2f} h; "
+            f"fixed-final Acc@1: {final_acc}"
+        )
 
 
 if __name__ == "__main__":
