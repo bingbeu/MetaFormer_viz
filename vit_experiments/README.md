@@ -21,7 +21,9 @@ python -m vit_experiments.train --help
 `batch-size x number of GPUs x accum-steps`; for example, the defaults give
 `16 x 2 x 2 = 64` on two GPUs. Training displays a rank-zero progress bar and
 writes step metrics to `train_steps.jsonl`, epoch metrics to `log.jsonl`, and
-arguments to `args.json` under the selected output directory. Use
+arguments to `args.json` under the selected output directory. By default the
+test split is evaluated only at the fixed final epoch (`--eval-every 0`) and is
+never used to select a checkpoint. The final checkpoint is `final.pth`. Use
 `--log-interval N` to control step-log frequency or `--no-progress` for plain
 JSON terminal output.
 
@@ -80,8 +82,9 @@ and the generated Part Tokens remain.
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m vit_experiments.train \
   --model curvpart_vit --data-path "$CUB_ROOT" --output outputs/eval \
-  --backbone vit_base_patch16_384 --checkpoint outputs/vit_curvpart_category/best.pth \
-  --eval
+  --backbone vit_base_patch16_384 \
+  --category-bank /raid/datasets/cub-200/category_embeddings.npy \
+  --checkpoint outputs/vit_curvpart_category/final.pth --eval
 
 torchrun --standalone --nproc_per_node=2 -m vit_experiments.train \
   --model curvpart_vit --data-path "$CUB_ROOT" --output outputs/vit_curvpart_category \
@@ -92,7 +95,7 @@ When evaluating a text-conditioned checkpoint, pass the same `--semantic-root` a
 `--category-bank` arguments used for training. Report at least three seeds for the
 final comparison; keep every argument except `--model` and output path identical.
 
-## Curvature controls
+## Matched curvature controls
 
 Use `--ablation no_hvp` to keep the first-order importance student while removing
 its training-only HVP supervision. Use `--ablation no_curvature` for a
@@ -100,3 +103,71 @@ parameter-matched Part-Token control with uniform token importance: it disables
 the HVP teacher, curvature regression, feature modulation, curvature weighting,
 and the token-dependent curvature attention bias. The default `--ablation full`
 is unchanged.
+
+Two teacher controls use exactly the same architecture, semantic bank, losses,
+and training schedule as the full model:
+
+- `--ablation gradient_teacher`: the target is the token-wise channel norm of
+  the gradient of the same visual--semantic compatibility objective;
+- `--ablation entropy_teacher`: if
+  `p_i = softmax_i(e_i / tau)` is compatibility normalized over image tokens,
+  the target is the token-wise spatial-entropy contribution `-p_i log p_i`.
+
+These definitions are implemented in `SemanticPartTokenGeneratorV6` and logged
+through `curv_reg_loss`. For paper-facing comparisons, always pass the same
+frozen `--category-bank` to every Curv-Part variant. Omitting it creates a
+learned random bank and prints a warning because that protocol does not match
+the frozen-bank paper setting.
+
+## Recommended three-seed matrix on eight GPUs
+
+The launcher uses four disjoint two-GPU groups, keeps the effective batch size
+at `16 x 2 x 2 = 64`, and queues the remaining jobs automatically:
+
+```bash
+python -m vit_experiments.launch_ablation_matrix \
+  --data-path "$CUB_ROOT" \
+  --category-bank /raid/datasets/cub-200/category_embeddings.npy \
+  --output-root outputs/vit_controls \
+  --gpus 0 1 2 3 4 5 6 7 --gpus-per-job 2 \
+  --seeds 42 43 44 --epochs 100 --batch-size 16 --accum-steps 2
+```
+
+The default matrix is `baseline`, `part_control`, `gradient_teacher`,
+`entropy_teacher`, and `full`. Preview every command without launching jobs:
+
+```bash
+python -m vit_experiments.launch_ablation_matrix \
+  --data-path "$CUB_ROOT" \
+  --category-bank /raid/datasets/cub-200/category_embeddings.npy \
+  --dry-run
+```
+
+After all runs finish, produce mean, sample standard deviation, and paired
+per-seed improvements over the baseline:
+
+```bash
+python -m vit_experiments.summarize_ablation \
+  --root outputs/vit_controls --seeds 42 43 44
+```
+
+## Empirical sensitivity validation
+
+This evaluation compares HVP, gradient, entropy, and student token rankings
+against an empirical central finite-difference estimate of the same
+visual--semantic compatibility objective. It is evaluation-only and defaults to
+a class-stratified subset of 200 CUB test images:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m vit_experiments.sensitivity_eval \
+  --checkpoint outputs/vit_controls/full_seed42/final.pth \
+  --data-path "$CUB_ROOT" \
+  --category-bank /raid/datasets/cub-200/category_embeddings.npy \
+  --max-images 200 --batch-size 4 --fd-eps 0.1 --fd-samples 4 \
+  --output outputs/vit_controls/sensitivity_seed42.json
+```
+
+The JSON contains per-image values and aggregate mean/sample-SD for Spearman
+rank agreement and top-10% overlap. Run the diagnostic on all three full-model
+seeds if it will support a formal statistical claim; one seed is sufficient for
+a clearly labeled mechanism diagnostic.
