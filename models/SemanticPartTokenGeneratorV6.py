@@ -226,14 +226,26 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             return None
         raise ValueError(f"Unknown teacher type: {teacher_type}")
 
-    def _compute_finite_difference_sensitivity(
+    def _compute_empirical_perturbation_responses(
         self, x, sem_per_part, eps=0.1, samples=4
     ):
-        """Empirical second directional derivative of token compatibility.
+        """Measure actual compatibility changes under equal-L2 perturbations.
 
-        Rademacher directions are unit-normalized, so eps is the L2 norm of the
-        perturbation applied independently to every token.  The computation is
-        vectorized over tokens and is intended for evaluation only.
+        Every visual token receives an independent unit-normalized Rademacher
+        direction, so ``eps`` is the same L2 perturbation magnitude for every
+        token.  Two complementary held-out targets are returned:
+
+        * ``total_change`` is the symmetric absolute compatibility change per
+          unit perturbation.  It contains first- and higher-order effects and is
+          the direct empirical quantity requested by the perturbation test.
+        * ``second_order`` is the absolute central second difference.  It
+          isolates local non-linearity and therefore directly tests whether an
+          HVP-based ranking captures second-order sensitivity better than
+          first-order, entropy, attention, or random rankings.
+
+        Token compatibility is separable over image tokens, which lets this
+        evaluation perturb all tokens in parallel without changing the result
+        that would be obtained by looping over tokens one at a time.
         """
         if eps <= 0 or samples < 1:
             raise ValueError("finite-difference eps and samples must be positive")
@@ -241,7 +253,8 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             teacher_x = x.detach().float()
             teacher_sem = sem_per_part.detach().float()
             _, center, _ = self._token_part_similarity(teacher_x, teacher_sem)
-            estimate = torch.zeros_like(center)
+            total_change = torch.zeros_like(center)
+            second_order = torch.zeros_like(center)
             inv_sqrt_dim = teacher_x.shape[-1] ** -0.5
             for _ in range(samples):
                 direction = self._make_probe(teacher_x) * inv_sqrt_dim
@@ -251,9 +264,27 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                 _, minus, _ = self._token_part_similarity(
                     teacher_x - eps * direction, teacher_sem
                 )
-                estimate.add_((plus - 2.0 * center + minus).abs() / (eps ** 2))
-            estimate.div_(float(samples))
-        return estimate.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+                total_change.add_(
+                    0.5 * ((plus - center).abs() + (minus - center).abs()) / eps
+                )
+                second_order.add_(
+                    (plus - 2.0 * center + minus).abs() / (eps ** 2)
+                )
+            total_change.div_(float(samples))
+            second_order.div_(float(samples))
+        return (
+            total_change.unsqueeze(-1).to(dtype=x.dtype, device=x.device),
+            second_order.unsqueeze(-1).to(dtype=x.dtype, device=x.device),
+        )
+
+    def _compute_finite_difference_sensitivity(
+        self, x, sem_per_part, eps=0.1, samples=4
+    ):
+        """Backward-compatible wrapper returning the second-order response."""
+        _, second_order = self._compute_empirical_perturbation_responses(
+            x, sem_per_part, eps=eps, samples=samples
+        )
+        return second_order
 
     def _normalize_curvature(self, curvature):
         # V3 原样：mean 归一化
@@ -472,10 +503,16 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             attr_tokens = (
                 torch.cat(tokens[1:], dim=1) if len(tokens) > 1 else cls_tokens
             )
-            _, sem_per_part, _ = self._part_attribute_semantics(
+            q, sem_per_part, _ = self._part_attribute_semantics(
                 attr_tokens, batch_size
             )
-            _, _, part_assign = self._token_part_similarity(x, sem_per_part)
+            cls_sem = self.class_proj(cls_tokens).to(dtype=x.dtype)
+            if self.use_category_grounding:
+                q = q + F.softplus(self.gamma_cls) * cls_sem
+
+            token_part_sim, _, part_assign = self._token_part_similarity(
+                x, sem_per_part
+            )
             token_sem = torch.einsum(
                 "bnp,bpc->bnc", part_assign.float(), sem_per_part.float()
             ).to(dtype=x.dtype)
@@ -483,6 +520,43 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             student = self.curv_head(
                 x + sem_gate * token_sem
             ).clamp_min(self.eps)
+
+            # Aggregate the exact pre-dropout Part-Token attention used by the
+            # forward path into one spatial score per token.  Mean aggregation
+            # gives every Part query equal weight and yields a distribution over
+            # image tokens that is directly comparable with the other scores.
+            student_normalized = self._normalize_curvature(student)
+            curv_prob = torch.softmax(
+                student_normalized.squeeze(-1) / self.curv_tau, dim=1
+            )
+            curv_weight = (
+                x.shape[1] * curv_prob
+            ).clamp(max=self.curv_weight_max)
+            feat_gain = self.feat_gain_max * self.curv_feat_alpha.sigmoid()
+            centered_weight = curv_weight - curv_weight.mean(dim=1, keepdim=True)
+            weighted_x = x * (1.0 + feat_gain * centered_weight.unsqueeze(-1))
+            keys = self.key_proj(weighted_x)
+            attn_logits = (q @ keys.transpose(-2, -1)) * self.scale
+            attn_logits = attn_logits + (
+                self.sim_logit_alpha.tanh()
+                * token_part_sim.transpose(1, 2)
+            )
+            attn_logits = attn_logits + (
+                self.curv_logit_alpha.tanh()
+                * torch.log1p(student_normalized).transpose(1, 2)
+            )
+            attention = torch.softmax(attn_logits, dim=-1).mean(
+                dim=1, keepdim=False
+            ).unsqueeze(-1)
+
+        perturbation, finite_difference = (
+            self._compute_empirical_perturbation_responses(
+                x,
+                sem_per_part,
+                eps=finite_difference_eps,
+                samples=finite_difference_samples,
+            )
+        )
 
         return {
             "hvp": self._normalize_curvature(
@@ -494,14 +568,11 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             "entropy": self._normalize_curvature(
                 self._compute_entropy_importance(x, sem_per_part)
             ).detach(),
-            "student": self._normalize_curvature(student).detach(),
+            "student": student_normalized.detach(),
+            "attention": self._normalize_curvature(attention).detach(),
+            "perturbation": self._normalize_curvature(perturbation).detach(),
             "finite_difference": self._normalize_curvature(
-                self._compute_finite_difference_sensitivity(
-                    x,
-                    sem_per_part,
-                    eps=finite_difference_eps,
-                    samples=finite_difference_samples,
-                )
+                finite_difference
             ).detach(),
         }
 
