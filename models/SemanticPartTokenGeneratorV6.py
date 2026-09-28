@@ -25,6 +25,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         attn_drop: float = 0.0,
         enable_hvp: bool = True,
         enable_curvature: bool = True,
+        teacher_type: str = None,
         assign_scale: float = 5.0,
         curv_tau: float = 1.0,
         hvp_probe: str = "rademacher",
@@ -47,6 +48,13 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         self.num_parts = num_parts
         self.enable_hvp = enable_hvp
         self.enable_curvature = enable_curvature
+        if teacher_type is None:
+            teacher_type = "hvp" if enable_hvp else "none"
+        if teacher_type not in {"hvp", "gradient", "entropy", "none"}:
+            raise ValueError(
+                "teacher_type must be one of: hvp, gradient, entropy, none"
+            )
+        self.teacher_type = teacher_type
         self.assign_scale = assign_scale
         self.curv_tau = max(curv_tau, 0.1)
         self.hvp_probe = hvp_probe
@@ -173,6 +181,80 @@ class SemanticPartTokenGeneratorV6(nn.Module):
             curvature = diag_estimate.norm(p=2, dim=-1, keepdim=True).detach()
         return curvature.to(dtype=x.dtype, device=x.device)
 
+    def _compute_gradient_importance(self, x, sem_per_part):
+        """First-order control using the same compatibility objective as HVP."""
+        with torch.enable_grad():
+            teacher_x = x.detach().float().requires_grad_(True)
+            teacher_sem = sem_per_part.detach().float()
+            _, per_token_sim, _ = self._token_part_similarity(
+                teacher_x, teacher_sem
+            )
+            objective = per_token_sim.mean()
+            gradient = torch.autograd.grad(objective, teacher_x)[0]
+            importance = gradient.norm(p=2, dim=-1, keepdim=True).detach()
+        return importance.to(dtype=x.dtype, device=x.device)
+
+    def _compute_entropy_importance(self, x, sem_per_part):
+        """Derivative-free token target from spatial compatibility entropy.
+
+        Let p_i be the softmax-normalized compatibility over image tokens.  The
+        target -p_i log p_i is each token's contribution to spatial entropy.
+        This definition remains non-degenerate when category fallback makes all
+        Part anchors identical.
+        """
+        with torch.no_grad():
+            teacher_x = x.detach().float()
+            teacher_sem = sem_per_part.detach().float()
+            _, per_token_sim, _ = self._token_part_similarity(
+                teacher_x, teacher_sem
+            )
+            spatial_prob = torch.softmax(
+                per_token_sim / self.curv_tau, dim=1
+            )
+            importance = -spatial_prob * spatial_prob.clamp_min(self.eps).log()
+        return importance.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+
+    def _compute_teacher_importance(self, x, sem_per_part, teacher_type=None):
+        teacher_type = self.teacher_type if teacher_type is None else teacher_type
+        if teacher_type == "hvp":
+            return self._compute_hvp_curvature(x, sem_per_part)
+        if teacher_type == "gradient":
+            return self._compute_gradient_importance(x, sem_per_part)
+        if teacher_type == "entropy":
+            return self._compute_entropy_importance(x, sem_per_part)
+        if teacher_type == "none":
+            return None
+        raise ValueError(f"Unknown teacher type: {teacher_type}")
+
+    def _compute_finite_difference_sensitivity(
+        self, x, sem_per_part, eps=0.1, samples=4
+    ):
+        """Empirical second directional derivative of token compatibility.
+
+        Rademacher directions are unit-normalized, so eps is the L2 norm of the
+        perturbation applied independently to every token.  The computation is
+        vectorized over tokens and is intended for evaluation only.
+        """
+        if eps <= 0 or samples < 1:
+            raise ValueError("finite-difference eps and samples must be positive")
+        with torch.no_grad():
+            teacher_x = x.detach().float()
+            teacher_sem = sem_per_part.detach().float()
+            _, center, _ = self._token_part_similarity(teacher_x, teacher_sem)
+            estimate = torch.zeros_like(center)
+            inv_sqrt_dim = teacher_x.shape[-1] ** -0.5
+            for _ in range(samples):
+                direction = self._make_probe(teacher_x) * inv_sqrt_dim
+                _, plus, _ = self._token_part_similarity(
+                    teacher_x + eps * direction, teacher_sem
+                )
+                _, minus, _ = self._token_part_similarity(
+                    teacher_x - eps * direction, teacher_sem
+                )
+                estimate.add_((plus - 2.0 * center + minus).abs() / (eps ** 2))
+            estimate.div_(float(samples))
+        return estimate.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+
     def _normalize_curvature(self, curvature):
         # V3 原样：mean 归一化
         denom = curvature.mean(dim=1, keepdim=True).clamp_min(self.curv_norm_eps).detach()
@@ -230,7 +312,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
         # 不改变任何可训练参数，也不改变分类/part-token 前向结果。
         if (
             self.enable_curvature
-            and (self.enable_hvp or force_hvp)
+            and (self.teacher_type != "none" or force_hvp)
             and (self.training or force_hvp)
             and torch.is_grad_enabled()
         ):
@@ -259,7 +341,10 @@ class SemanticPartTokenGeneratorV6(nn.Module):
 
             pred_curvature_reg = pred_curvature_reg.clamp_min(self.eps)
 
-            hvp_curvature = self._compute_hvp_curvature(x, sem_per_part)
+            target_type = "hvp" if force_hvp else self.teacher_type
+            hvp_curvature = self._compute_teacher_importance(
+                x, sem_per_part, teacher_type=target_type
+            )
 
             student_curvature_reg = self._normalize_curvature(pred_curvature_reg)
             teacher_curvature = self._normalize_curvature(
@@ -336,6 +421,7 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                     None if teacher_curvature is None
                     else teacher_curvature.detach()
                 ),
+                "teacher_type": self.teacher_type,
 
                 # Curvature policy
                 "curv_prob": curv_prob.detach(),
@@ -360,6 +446,64 @@ class SemanticPartTokenGeneratorV6(nn.Module):
                 "gate_status": self.gate_status(),
             }
         return part_tokens
+
+    def diagnostic_targets(
+        self,
+        x,
+        extra_tokens,
+        finite_difference_eps=0.1,
+        finite_difference_samples=4,
+    ):
+        """Return comparable token scores without changing predictions.
+
+        This method is used by ``vit_experiments.sensitivity_eval`` on a held-out
+        split.  It recomputes the generator's local representation, then returns
+        the HVP, gradient, entropy, student, and empirical finite-difference
+        scores on the same visual--semantic compatibility objective.
+        """
+        with torch.no_grad():
+            x = self.input_proj(self._flatten_input(x))
+            batch_size = x.shape[0]
+            tokens = [
+                self._expand_token(t, batch_size, x.device, x.dtype)
+                for t in extra_tokens
+            ]
+            cls_tokens = tokens[0]
+            attr_tokens = (
+                torch.cat(tokens[1:], dim=1) if len(tokens) > 1 else cls_tokens
+            )
+            _, sem_per_part, _ = self._part_attribute_semantics(
+                attr_tokens, batch_size
+            )
+            _, _, part_assign = self._token_part_similarity(x, sem_per_part)
+            token_sem = torch.einsum(
+                "bnp,bpc->bnc", part_assign.float(), sem_per_part.float()
+            ).to(dtype=x.dtype)
+            sem_gate = self.curv_sem_alpha.tanh().to(dtype=x.dtype)
+            student = self.curv_head(
+                x + sem_gate * token_sem
+            ).clamp_min(self.eps)
+
+        return {
+            "hvp": self._normalize_curvature(
+                self._compute_hvp_curvature(x, sem_per_part)
+            ).detach(),
+            "gradient": self._normalize_curvature(
+                self._compute_gradient_importance(x, sem_per_part)
+            ).detach(),
+            "entropy": self._normalize_curvature(
+                self._compute_entropy_importance(x, sem_per_part)
+            ).detach(),
+            "student": self._normalize_curvature(student).detach(),
+            "finite_difference": self._normalize_curvature(
+                self._compute_finite_difference_sensitivity(
+                    x,
+                    sem_per_part,
+                    eps=finite_difference_eps,
+                    samples=finite_difference_samples,
+                )
+            ).detach(),
+        }
 
 
 # 若训练脚本按旧名导入，取消下一行注释即可无缝替换：
